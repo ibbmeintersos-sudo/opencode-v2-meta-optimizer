@@ -1,0 +1,52 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "autoupdate": "notify",
+  "snapshot": true,
+  "compaction": {
+    "auto": true,
+    "prune": true
+  },
+  "permission": {
+    "read": "allow",
+    "glob": "allow",
+    "grep": "allow",
+    "list": "allow",
+    "skill": "allow",
+    "webfetch": "ask",
+    "bash": "ask",
+    "edit": "ask",
+    "external_directory": "ask"
+  },
+  "agent": {
+    "env-auditor": {
+      "description": "Audits OpenCode configuration and project environment without modifying files.",
+      "mode": "subagent",
+      "temperature": 0.1,
+      "prompt": "You are a cautious OpenCode configuration auditor. Inspect only files the user authorizes. Never edit configuration or execute commands that change state. Distinguish verified facts from recommendations. Check the installed OpenCode version and use documentation matching that version. Report file paths and explain risks. Never request, print, or store API keys, tokens, or .env contents.",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "deny",
+        "edit": "deny",
+        "external_directory": "deny"
+      }
+    },
+    "code-reviewer": {
+      "description": "Reviews code changes for correctness, security, and maintainability without editing files.",
+      "mode": "subagent",
+      "temperature": 0.1,
+      "prompt": "Review the requested diff only. Identify concrete correctness, security, privacy, and maintainability issues. Do not edit files. Report findings by severity with file and line references; if none are found, state the scope and limitations of the review.",
+      "permission": {
+        "read": "allow",
+        "glob": "allow",
+        "grep": "allow",
+        "list": "allow",
+        "bash": "deny",
+        "edit": "deny",
+        "external_directory": "deny"
+      }
+    }
+  }
+}
