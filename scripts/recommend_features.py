@@ -67,24 +67,39 @@ def detect_version() -> tuple[str, str]:
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return "Not detected", "OpenCode CLI was not found on PATH; Desktop installation was not independently inspected"
 
-def global_config_dir() -> Path:
+def global_config_dirs() -> list[Path]:
+    """Return documented and common global config dirs, without assuming one OS path."""
+    roots=[]
+    xdg=os.environ.get("XDG_CONFIG_HOME")
+    if xdg: roots.append(Path(xdg).expanduser())
+    roots.append(Path.home()/".config")  # documented OpenCode global config location
     if os.name == "nt":
         appdata=os.environ.get("APPDATA")
-        return Path(appdata)/"opencode" if appdata else Path.home()/"AppData"/"Roaming"/"opencode"
-    return Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home()/".config")))/"opencode"
+        if appdata: roots.append(Path(appdata)/"opencode")
+    result=[]; seen=set()
+    for root in roots:
+        directory=root if root.name.lower()=="opencode" else root/"opencode"
+        key=str(directory).casefold()
+        if key not in seen: seen.add(key); result.append(directory)
+    return result
 
 def config_candidates(project_dir: Path) -> list[Path]:
     paths=[]
     custom=os.environ.get("OPENCODE_CONFIG")
     if custom: paths.append(Path(custom).expanduser())
-    root=global_config_dir()
-    paths.extend([root/"opencode.json", root/"opencode.jsonc"])
-    paths.extend([project_dir/"opencode.json", project_dir/"opencode.jsonc"])
+    for directory in global_config_dirs():
+        paths.extend([directory/"opencode.json", directory/"opencode.jsonc"])
+    # Include the supplied project folder and ascend only through its Git root.
+    directory=project_dir
+    while True:
+        paths.extend([directory/"opencode.json", directory/"opencode.jsonc"])
+        if (directory/".git").exists() or directory.parent==directory: break
+        directory=directory.parent
     result=[]; seen=set()
-    for p in paths:
-        try: key=str(p.resolve())
-        except OSError: key=str(p)
-        if key not in seen and p.is_file(): seen.add(key); result.append(p)
+    for path in paths:
+        try: key=str(path.resolve()).casefold()
+        except OSError: key=str(path).casefold()
+        if key not in seen and path.is_file(): seen.add(key); result.append(path)
     return result
 
 def load_jsonc(path: Path) -> dict|None:
@@ -101,14 +116,16 @@ def detect_signals(configs: list[dict], project_dir: Path) -> dict:
     merged={}
     for config in configs: merged.update(config)
     opencode_dir=project_dir/".opencode"
-    global_dir=global_config_dir()
-    agents=any((d/"agents").is_dir() and any((d/"agents").glob("*.md")) for d in (opencode_dir,global_dir))
-    skills=any((d/"skills").is_dir() and any((d/"skills").rglob("SKILL.md")) for d in (opencode_dir,global_dir))
+    agent_dirs=[opencode_dir/"agents"]+[d/"agents" for d in global_config_dirs()]
+    skill_dirs=[opencode_dir/"skills"]+[d/"skills" for d in global_config_dirs()]
+    plugin_dirs=[opencode_dir/"plugins"]+[d/"plugins" for d in global_config_dirs()]
+    agents=any(d.is_dir() and any(d.glob("*.md")) for d in agent_dirs)
+    skills=any(d.is_dir() and any(d.rglob("SKILL.md")) for d in skill_dirs)
     return {
       "agents": bool(merged.get("agent")) or agents,
       "skills": bool(merged.get("skills")) or skills,
       "mcp": bool(merged.get("mcp",{}).get("servers")) if isinstance(merged.get("mcp",{}),dict) else False,
-      "plugin": bool(merged.get("plugin")) or bool(merged.get("plugins")),
+      "plugin": bool(merged.get("plugin")) or bool(merged.get("plugins")) or any(d.is_dir() and any(d.glob("*.js")) for d in plugin_dirs),
       "formatter": bool(merged.get("formatter")), "lsp": bool(merged.get("lsp")),
       "worktree": bool(merged.get("worktree")) or bool(merged.get("experimental",{}).get("worktree")) if isinstance(merged.get("experimental",{}),dict) else bool(merged.get("worktree")),
       "compaction": bool(merged.get("compaction")), "snapshot": "snapshot" in merged,
@@ -136,15 +153,26 @@ def build_report(project_dir: Path, offline: bool=False) -> str:
             if text: results[name]=text
             else: errors[name]=error or "unavailable"
     release=latest_changelog_version(results.get("Changelog"))
-    lines=["# OpenCode Feature Discovery Report","",f"Generated: {now}","", "## Environment detected", "",f"- OpenCode version: **{version}** ({version_evidence})", f"- Latest version listed on official changelog: **{release or 'not detected'}**",f"- Config files found and parsed: **{len(configs)}** (paths are intentionally not printed to avoid disclosing usernames or local layout)", f"- Provider/model settings detected: **{'yes' if any(c.get('provider') or c.get('model') for c in configs) else 'no'}** (values are not displayed)",f"- Project directory: `{project_dir.name or '.'}` (only project config and standard global locations were inspected)",f"- Online documentation checks: **{len(results)}/{len(DOCS)}** pages fetched" if not offline else "- Online documentation checks: skipped (`--offline`)","", "> This is a recommendation report, not a full resolved-config audit. OpenCode's config precedence, custom directories, environment content, and Desktop-specific state may not be fully visible here. No configuration was changed.","", "## Recommendations", ""]
+    lines=["# OpenCode Feature Discovery Report","",f"Generated: {now}","", "## Environment detected", "",f"- OpenCode version: **{version}** ({version_evidence})", f"- Latest version listed on official changelog: **{release or 'not detected'}**",f"- Config files found: **{len(paths)}**; successfully parsed: **{len(configs)}** (paths are intentionally not printed)", f"- Provider/model settings detected: **{'yes' if any(c.get('provider') or c.get('model') for c in configs) else 'no' if configs else 'unknown - no config parsed'}** (values are not displayed)",f"- Project directory: `{project_dir.name or '.'}` (the directory and parents up to its Git root plus standard global locations were inspected)",f"- Online documentation checks: **{len(results)}/{len(DOCS)}** pages fetched" if not offline else "- Online documentation checks: skipped (`--offline`)","", "> This is a recommendation report, not a full resolved-config audit. OpenCode's config precedence, custom directories, environment content, and Desktop-specific state may not be fully visible here. No configuration was changed."]
+    if not configs:
+        lines += ["", "> **Important:** No configuration file was parsed. Every ‘not detected’ feature status below means only that it was not found in the inspected locations; it does not prove the feature is absent or disabled. Check the config path and rerun before using these results as an audit."]
+    lines += ["", "## Recommendations", ""]
     for feature in FEATURES:
         if feature["source"] not in results:
             continue
         configured=signals.get(feature["need"],False)
-        if feature["id"]=="snapshot" and configured: state="Explicitly configured"
+        if feature["id"]=="worktree":
+            state="Documented OpenCode workflow; not a config flag to detect"
+        elif not configs and feature["id"]!="worktree":
+            state="Unknown - no local config was parsed"
+        elif feature["id"]=="snapshot" and configured: state="Explicitly configured"
         elif configured: state="Detected in inspected config/files"
         else: state="Not detected in inspected config/files"
-        if feature["id"]=="snapshot" and not configured:
+        if feature["id"]=="worktree":
+            recommendation=f"The official changelog documents Desktop and CLI worktree workflows. Check that they are available in detected version {version}, then test with a disposable Git repository. No config change is suggested."
+        elif not configs:
+            recommendation="Cannot make a configuration-specific recommendation until the correct config path is detected; this is a general feature candidate only."
+        elif feature["id"]=="snapshot" and not configured:
             recommendation="Check whether snapshots are enabled by the installed OpenCode default; absence from config does not prove snapshots are disabled."
         elif configured:
             recommendation="Review whether the existing setup meets your use case; avoid adding duplicates."

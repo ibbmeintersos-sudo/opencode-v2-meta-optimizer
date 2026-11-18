@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -28,11 +29,38 @@ class FeatureReportTests(unittest.TestCase):
             self.assertIn("offline mode", report)
             self.assertEqual(config.read_bytes(), before)
 
-    def test_recommendation_not_made_when_source_unavailable(self):
+    def test_no_config_means_unknown_not_absent(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch.object(module, "detect_version", return_value=("v2.0.0", "test")):
-                report = module.build_report(Path(tmp), offline=True)
-            self.assertNotIn("### Agent-specific least-privilege permissions", report)
+            with patch.object(module, "detect_version", return_value=("v2.3.2", "test")), \
+                 patch.object(module, "DOCS", {"Agents": "https://opencode.ai/docs/agents/"}), \
+                 patch.object(module, "fetch_text", return_value=("official agents docs", None)):
+                report = module.build_report(Path(tmp))
+            self.assertIn("No configuration file was parsed", report)
+            self.assertIn("Unknown - no local config was parsed", report)
+            self.assertIn("Cannot make a configuration-specific recommendation", report)
+
+    def test_project_and_documented_home_config_paths_are_searched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            project = root / "repo"
+            (home / ".config" / "opencode").mkdir(parents=True)
+            (home / ".config" / "opencode" / "opencode.json").write_text("{}", encoding="utf-8")
+            project.mkdir()
+            (project / "opencode.jsonc").write_text("{}", encoding="utf-8")
+            with patch("pathlib.Path.home", return_value=home), patch.dict(os.environ, {"OPENCODE_CONFIG": "", "XDG_CONFIG_HOME": ""}, clear=False):
+                found = module.config_candidates(project)
+            self.assertIn(home / ".config" / "opencode" / "opencode.json", found)
+            self.assertIn(project / "opencode.jsonc", found)
+
+    def test_worktree_is_reported_as_a_capability_not_config_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.object(module, "detect_version", return_value=("v2.3.2", "test")), \
+                 patch.object(module, "DOCS", {"Changelog": "https://opencode.ai/changelog"}), \
+                 patch.object(module, "fetch_text", return_value=("v2.3.2 worktree", None)):
+                report = module.build_report(Path(tmp))
+            self.assertIn("not a config flag to detect", report)
+            self.assertIn("detected version v2.3.2", report)
 
     def test_fetch_uses_only_fixed_official_sources(self):
         self.assertTrue(all(url.startswith("https://opencode.ai/") for url in module.DOCS.values()))
