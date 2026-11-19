@@ -20,6 +20,7 @@ DOCS = {
     "Skills": "https://opencode.ai/docs/skills/",
     "MCP servers": "https://opencode.ai/docs/mcp-servers/",
     "Tools and permissions": "https://opencode.ai/docs/tools/",
+    "Custom tools": "https://opencode.ai/docs/custom-tools/",
     "Plugins": "https://opencode.ai/docs/plugins/",
     "Formatters": "https://opencode.ai/docs/formatters/",
     "LSP servers": "https://opencode.ai/docs/lsp/",

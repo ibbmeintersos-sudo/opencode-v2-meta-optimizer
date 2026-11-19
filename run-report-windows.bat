@@ -18,22 +18,30 @@ if not errorlevel 1 (
 )
 
 echo.
-echo OpenCode Feature Report - no configuration will be changed.
-echo Paste the folder containing the OpenCode project you want to inspect.
-set /p "TARGET_DIR=Project folder (leave blank to inspect your user-level config only): "
-if "%TARGET_DIR%"=="" set "TARGET_DIR=%USERPROFILE%"
-
-%PYTHON% "%SCRIPT_DIR%scripts\recommend_features.py" --project-dir "%TARGET_DIR%" --output "%SCRIPT_DIR%opencode-feature-report.md"
+echo OpenCode Deep Audit - read-only; no config will be changed.
+echo Leave the path blank to audit global user settings only.
+echo Enter a source-code project folder to include project-specific config and language detection.
+set /p "TARGET_DIR=Project folder (blank = global settings only): "
+echo.
+echo Optional: check live MCP connections? This may start local processes or contact remote servers.
+set /p "CHECK_MCP=Run that optional connection check? [y/N]: "
+set "CHECK_ARGS="
+if /I "%CHECK_MCP%"=="Y" set "CHECK_ARGS=--check-mcp"
+if "%TARGET_DIR%"=="" (
+  %PYTHON% "%SCRIPT_DIR%scripts\deep_audit.py" --global-only %CHECK_ARGS% --output "%SCRIPT_DIR%opencode-deep-audit.md"
+) else (
+  %PYTHON% "%SCRIPT_DIR%scripts\deep_audit.py" --project-dir "%TARGET_DIR%" %CHECK_ARGS% --output "%SCRIPT_DIR%opencode-deep-audit.md"
+)
 if errorlevel 1 (
   echo.
-  echo Report generation failed. Confirm Python 3.10+ is installed and try again.
+  echo Audit failed. Confirm Python 3.10+ is installed and try again.
   pause
   exit /b 1
 )
 
-if exist "%SCRIPT_DIR%opencode-feature-report.md" (
-  start "" notepad.exe "%SCRIPT_DIR%opencode-feature-report.md"
+if exist "%SCRIPT_DIR%opencode-deep-audit.md" (
+  start "" notepad.exe "%SCRIPT_DIR%opencode-deep-audit.md"
 )
 echo.
-echo The report only recommends changes; it does not apply them.
+echo The audit never applies recommendations. If you selected MCP, it may have checked connections.
 pause
