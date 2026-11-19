@@ -4,7 +4,7 @@ This note records the official-source behavior the audit rules are based on. Ope
 
 ## Configuration and precedence
 
-The official configuration page documents JSON/JSONC and the general merge order: remote defaults, global `~/.config/opencode/opencode.json`, `OPENCODE_CONFIG`, project `opencode.json`, `.opencode` resources, inline `OPENCODE_CONFIG_CONTENT`, then managed policy. `OPENCODE_CONFIG_DIR` adds agent/command/plugin resources. Managed config paths include `%ProgramData%\opencode` on Windows, `/etc/opencode` on Linux, and `/Library/Application Support/opencode` on macOS. The auditor does not call `opencode debug config`, because resolved output could expose sensitive values.
+The official configuration page documents JSON/JSONC and the general merge order: remote defaults, global `~/.config/opencode/opencode.json`, `OPENCODE_CONFIG`, project `opencode.json`, `.opencode` resources, inline `OPENCODE_CONFIG_CONTENT`, then managed policy. `OPENCODE_CONFIG_DIR` adds agent/command/plugin resources. Managed config paths include `%ProgramData%\opencode` on Windows, `/etc/opencode` on Linux, and `/Library/Application Support/opencode` on macOS. The auditor runs the installed CLI’s documented `opencode debug config` command when available, parses it locally, redacts credential-like fields in memory, and discards raw output.
 
 Source: <https://opencode.ai/docs/config/>
 
@@ -41,3 +41,13 @@ Sources:
 - <https://opencode.ai/docs/formatters/>
 - <https://opencode.ai/docs/lsp/>
 - <https://opencode.ai/changelog>
+
+## Official source coverage and v2 release checks
+
+The collector checks fixed public HTTPS endpoints: `opencode.ai`, the docs inventory at `/docs/llms.txt`, the official changelog, GitHub repository metadata and README API, and the repository Releases API. It records source status and retrieval time, uses bounded response bodies, and requires no GitHub token. README ingestion is limited to summary headings and its blob SHA; the full README is not copied into the report.
+
+Latest stable v2 is selected from GitHub Releases records whose tags match `v2.<minor>.<patch>`, with `draft` and `prerelease` false, sorted numerically. The candidate is corroborated against the first v2 release label detected on the changelog. If the API and changelog disagree or either is unavailable, the report labels the latest-v2 claim unconfirmed and does not use `/releases/latest`, component tags, Discord, or X as definitive sources. Release publication time and local retrieval time are reported separately.
+
+The official Discord shortcut is shown as a manual community link only; the auditor does not join, log in, or read private channels. `x.com/opencode` is shown as a user-provided announcement link; ownership is not independently verified and X is not scraped or treated as the canonical release source.
+
+Sources: <https://opencode.ai/> · <https://opencode.ai/docs/llms.txt> · <https://opencode.ai/changelog> · <https://github.com/anomalyco/opencode> · <https://github.com/anomalyco/opencode/releases> · <https://api.github.com/repos/anomalyco/opencode/releases?per_page=20&page=1> · <https://opencode.ai/discord> · <https://x.com/opencode>

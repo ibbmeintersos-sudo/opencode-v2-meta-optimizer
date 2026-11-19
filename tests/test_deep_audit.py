@@ -137,9 +137,13 @@ class DeepAuditTests(unittest.TestCase):
                  patch.object(audit,"skill_roots",return_value=[]), \
                  patch.object(audit,"configured_skill_roots",return_value=([],0)), \
                  patch.object(audit,"fetch_schema",return_value=({"properties":{"model":{"type":"string"}}},None)), \
-                 patch.object(audit.base,"fetch_text",return_value=(None,"offline test")):
+                 patch.object(audit.base,"fetch_text",return_value=("v2.3.2",None)), \
+                 patch.object(audit.base,"collect_official_source_data",return_value={"website":{"ok":True},"docs_inventory":{"ok":True,"item_count":69},"github_repo":{"ok":True,"full_name":"anomalyco/opencode","default_branch":"dev"},"github_readme":{"ok":True,"sha":"abc","size":100,"headings":["OpenCode"]},"github_releases":{"ok":True,"latest_v2":{"version":"v2.3.2","url":"https://github.com/anomalyco/opencode/releases/tag/v2.3.2","published_at":"2026-11-18T01:35:12Z"},"records_read":20,"pages_read":1,"scan_complete":True}}):
                 report=audit.create_report(home,global_only=True)
             self.assertIn("installed CLI debug config",report)
+            self.assertIn("Additional official sources",report)
+            self.assertIn("Latest stable v2 candidate from GitHub Releases: **v2.3.2**",report)
+            self.assertIn("v2 release corroboration: **confirmed by changelog and complete Releases scan**",report)
             self.assertNotIn("Config key not found in current official schema: future_feature",report)
             self.assertIn("provider/model",report)
 
