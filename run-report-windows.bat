@@ -23,6 +23,10 @@ echo Leave the path blank to audit global user settings only.
 echo Enter a source-code project folder to include project-specific config and language detection.
 set /p "TARGET_DIR=Project folder (blank = global settings only): "
 echo.
+echo If OpenCode CLI is not on PATH, enter its full executable path. Otherwise leave blank.
+set /p "CLI_PATH=OpenCode CLI path (optional): "
+if not "%CLI_PATH%"=="" set "OPENCODE_CLI=%CLI_PATH%"
+echo.
 echo Optional: check live MCP connections? This may start local processes or contact remote servers.
 set /p "CHECK_MCP=Run that optional connection check? [y/N]: "
 set "CHECK_ARGS="

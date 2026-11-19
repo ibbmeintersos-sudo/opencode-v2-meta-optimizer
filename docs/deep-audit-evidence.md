@@ -14,7 +14,10 @@ The live schema at <https://opencode.ai/config.json> includes current plural for
 
 The schema's current tool permission rules use ordered records with `action`, `resource`, and `effect`; agent definitions can carry `permissions`. The schema and docs have changed over time, so permission resolution in this utility is a static approximation, not a reproduction of OpenCode runtime policy evaluation.
 
+The official CLI reference lists `opencode debug config` as “Show the resolved configuration.” This is why the audit prefers that output from the selected installed CLI over interpreting the live JSON Schema as the sole authority. The schema remains useful for editor validation but can be newer or older than the installed build.
+
 Sources:
+- <https://opencode.ai/docs/cli/commands/>
 - <https://opencode.ai/config.json>
 - <https://opencode.ai/docs/agents/>
 - <https://opencode.ai/docs/tools/>

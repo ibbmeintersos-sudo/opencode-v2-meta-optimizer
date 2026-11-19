@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import urllib.request
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -150,6 +151,54 @@ def merge_dicts(target: dict, override: dict, path=()) -> dict:
     return result
 
 
+def redact_secret_values(value):
+    """Return a copy with values under credential-like keys removed."""
+    if isinstance(value,dict):
+        return {key:("[redacted]" if is_secret_key(str(key)) and child not in (None,"",False) else redact_secret_values(child)) for key,child in value.items()}
+    if isinstance(value,list): return [redact_secret_values(child) for child in value]
+    return value
+
+
+def parse_debug_config_output(text):
+    """Parse the JSON object emitted by `opencode debug config`; never expose raw text."""
+    decoder=json.JSONDecoder()
+    for index,char in enumerate(text):
+        if char!="{": continue
+        try: value,end=decoder.raw_decode(text[index:])
+        except (json.JSONDecodeError,ValueError): continue
+        if isinstance(value,dict) and (index==len(text)-len(text.lstrip()) or "$schema" in value or any(key in value for key in ("model","agents","agent","mcp","permission","permissions","provider","providers"))):
+            return redact_secret_values(value)
+    return None
+
+
+def debug_config(project_dir: Path, global_only=False, cli_path=None, timeout=35):
+    """Read resolved config from the installed CLI; raw stdout/stderr stay in memory and are discarded."""
+    candidate=cli_path or os.environ.get("OPENCODE_CLI") or shutil.which("opencode")
+    if not candidate:
+        return {"status":"CLI unavailable","config":None,"version":None}
+    executable=str(candidate)
+    try:
+        version_result=subprocess.run([executable,"--version"],capture_output=True,text=True,timeout=8,check=False,stdin=subprocess.DEVNULL)
+        version=(version_result.stdout or version_result.stderr).strip().splitlines()
+        version=version[0][:120] if version_result.returncode==0 and version else None
+    except (OSError,subprocess.TimeoutExpired): version=None
+    try:
+        if global_only:
+            # A fresh neutral directory prevents a nearby project config from entering a global-only audit.
+            with tempfile.TemporaryDirectory(prefix="opencode-audit-") as neutral_dir:
+                result=subprocess.run([executable,"debug","config"],cwd=neutral_dir,capture_output=True,text=True,timeout=timeout,check=False,stdin=subprocess.DEVNULL)
+        else:
+            result=subprocess.run([executable,"debug","config"],cwd=str(project_dir),capture_output=True,text=True,timeout=timeout,check=False,stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        return {"status":"timed out","config":None,"version":version}
+    except OSError:
+        return {"status":"could not launch","config":None,"version":version}
+    config=parse_debug_config_output(result.stdout or "") if result.returncode==0 else None
+    if config is not None:
+        return {"status":"resolved config loaded from installed CLI","config":config,"version":version}
+    return {"status":"CLI returned non-JSON config or an error (details withheld)","config":None,"version":version}
+
+
 def type_ok(value, schema_type):
     allowed=schema_type if isinstance(schema_type,list) else [schema_type]
     checks={"object":lambda x:isinstance(x,dict),"array":lambda x:isinstance(x,list),"string":lambda x:isinstance(x,str),"boolean":lambda x:isinstance(x,bool),"integer":lambda x:isinstance(x,int) and not isinstance(x,bool),"number":lambda x:isinstance(x,(int,float)) and not isinstance(x,bool),"null":lambda x:x is None}
@@ -278,6 +327,11 @@ def safe_label(value, limit=80):
     text=str(value)
     if "://" in text or re.search(r"[^/]+:[^/]*@",text): return "[redacted]"
     return text[:limit] if re.fullmatch(r"[@A-Za-z0-9_.:/-]{1,"+str(limit)+r"}",text) else "[redacted]"
+
+
+def safe_version(value):
+    text=str(value or "")[:120]
+    return text if re.fullmatch(r"[A-Za-z0-9 .()+_-]{1,120}",text) else "unrecognized version text"
 
 
 def is_secret_key(key: str) -> bool:
@@ -508,12 +562,13 @@ def summarize_mcp(merged):
     return out
 
 
-def check_mcp_runtime(timeout=45):
+def check_mcp_runtime(cli_path=None,timeout=45):
     """Opt-in runtime check; only returns server IDs and coarse status, never raw output."""
-    if not shutil.which("opencode"):
+    executable=cli_path or os.environ.get("OPENCODE_CLI") or shutil.which("opencode")
+    if not executable:
         return {"requested":True,"status":"CLI unavailable","servers":[],"returncode":None}
     try:
-        result=subprocess.run(["opencode","mcp","list"],capture_output=True,text=True,timeout=timeout,check=False,stdin=subprocess.DEVNULL)
+        result=subprocess.run([str(executable),"mcp","list"],capture_output=True,text=True,timeout=timeout,check=False,stdin=subprocess.DEVNULL)
     except subprocess.TimeoutExpired:
         return {"requested":True,"status":"timed out","servers":[],"returncode":None}
     except OSError:
@@ -535,14 +590,20 @@ def check_mcp_runtime(timeout=45):
     return {"requested":True,"status":"completed" if result.returncode==0 else "nonzero exit","servers":statuses,"returncode":result.returncode}
 
 
-def create_report(project_dir: Path, offline=False, global_only=False, check_mcp=False):
+def create_report(project_dir: Path, offline=False, global_only=False, check_mcp=False, use_debug_config=True, cli_path=None):
     version,version_evidence=base.detect_version()
     records=config_sources(project_dir,global_only)
     parsed=[r for r in records if r["data"] is not None]
     active_parsed=[r for r in parsed if r["scope"]!="alternate global candidate"]
     analysis_records=active_parsed or [r for r in parsed if r["scope"]=="alternate global candidate"]
-    merged={}
-    for record in analysis_records: merged=merge_dicts(merged,record["data"])
+    static_merged={}
+    for record in analysis_records: static_merged=merge_dicts(static_merged,record["data"])
+    debug_result=debug_config(project_dir,global_only,cli_path) if use_debug_config else {"status":"skipped by user","config":None,"version":None}
+    if debug_result.get("version"):
+        version=debug_result["version"]
+        version_evidence="detected from the selected CLI used for `debug config`"
+    merged=debug_result["config"] if isinstance(debug_result.get("config"),dict) else static_merged
+    config_source="installed CLI debug config" if debug_result.get("config") is not None else "static file merge (fallback)"
     roots=source_roots(project_dir,global_only)
     extra_skill_roots,remote_skill_catalogs=configured_skill_roots(merged,project_dir)
     agents,skills,commands,plugins,custom_tools=inventory_files(roots,skill_roots(project_dir,global_only)+extra_skill_roots)
@@ -550,8 +611,13 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
     languages,file_count,truncated=({},0,False) if global_only else scan_languages(project_dir)
     schema,schema_error=(None,"offline mode") if offline else fetch_schema()
     schema_findings,schema_ok=top_schema_check(parsed,schema) if schema else ([],False)
+    if debug_result.get("config") is not None and schema:
+        # A live schema may lag the installed build. Suppress schema-only unknown/deprecated/type
+        # warnings for fields the installed CLI retained; syntax/parse problems remain visible.
+        accepted_keys=set(merged)
+        schema_findings=[item for item in schema_findings if not (item["code"] in ("UNKNOWN_CONFIG_KEY","DEPRECATED_CONFIG_KEY","CONFIG_TYPE") and item["title"].split(": ",1)[-1] in accepted_keys)]
     findings=schema_findings+analyze(analysis_records,merged,agents,skills,commands,plugins,project_dir,schema_ok,remote_skill_catalogs,custom_tools)
-    mcp_runtime=check_mcp_runtime() if check_mcp else {"requested":False,"status":"not run","servers":[],"returncode":None}
+    mcp_runtime=check_mcp_runtime(cli_path) if check_mcp else {"requested":False,"status":"not run","servers":[],"returncode":None}
     if check_mcp:
         for entry in mcp_runtime["servers"]:
             if entry["status"]!="connected":
@@ -591,10 +657,12 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
         add_finding(findings,"Informational","MODEL_NOT_EXPLICIT","No default model is explicit in loaded config","No top-level `model` value was found; model selection may be stored by the Desktop account/session instead.","The tool cannot compare configured model suitability, cost, or context size from this file.","Check the Desktop model picker and provider availability; do not infer a missing model solely from this config.",base.DOCS["Configuration"])
     severity_order={"Critical":0,"High":1,"Medium":2,"Low":3,"Informational":4}
     findings.sort(key=lambda item:(severity_order.get(item["severity"],5),item["code"],item["title"]))
-    lines=["# OpenCode Deep Environment Audit", "",f"Generated: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}","", "## Executive assessment", "", f"- Detected CLI version: **{version}** ({version_evidence})", f"- Latest release found on fetched changelog page: **{current or 'not recognized'}**",f"- Candidate config files: **{len(records)}**; parsed successfully: **{len(parsed)}**",f"- OpenCode support directories inspected: **{len(roots)}**",f"- Project files sampled for language types: **{file_count}{'+' if truncated else ''}**"+(" (global-only mode)" if global_only else ""),f"- Official docs retrieved: **{len(docs)}/{len(base.DOCS)}**; schema: **{'available' if schema_ok else 'unavailable'}**", "", "> This is evidence-based analysis, not a score or proof of runtime correctness. The default is static; only the explicit `--check-mcp` option may start MCP processes/contact endpoints. No settings are edited, secret values are not printed, and local config is not sent to an AI service.",""]
+    lines=["# OpenCode Deep Environment Audit", "",f"Generated: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}","", "## Executive assessment", "", f"- Detected CLI version: **{safe_version(version)}** ({version_evidence})", f"- Latest release found on fetched changelog page: **{current or 'not recognized'}**",f"- Candidate config files: **{len(records)}**; parsed successfully: **{len(parsed)}**",f"- OpenCode support directories inspected: **{len(roots)}**",f"- Project files sampled for language types: **{file_count}{'+' if truncated else ''}**"+(" (global-only mode)" if global_only else ""),f"- Official docs retrieved: **{len(docs)}/{len(base.DOCS)}**; schema: **{'available' if schema_ok else 'unavailable'}**", "", "> The installed CLI `debug config` is the primary effective-config source when available. Live schema and official v2 documentation are supporting references; this is not proof that Desktop bundles the same build. No settings are edited, secret values are not printed, and local config is not sent to an AI service.",""]
     if not records or not parsed:
         lines += ["> **Coverage warning:** No usable config file was parsed. Configuration-dependent conclusions are unknown; see findings. Verify the path and rerun before acting.",""]
     lines += ["## Configuration coverage and precedence",""]
+    lines.append(f"- Effective-config source: **{config_source}** ({debug_result['status']}); CLI version: **{safe_version(debug_result.get('version') or 'not detected')}**.")
+    lines.append("- `opencode debug config` output is parsed locally; credential-like values are redacted in memory before analysis, and raw stdout/stderr are never included in the report. The CLI may load supported remote config, depending on its build and login state.")
     if records:
         for r in records:
             status="parsed" if r["data"] is not None else "unreadable/invalid"
@@ -607,7 +675,7 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
         if overlaps:
             lines.append("- Root settings present in multiple layers: "+", ".join(f"`{k}` ({' → '.join(v)})" for k,v in sorted(overlaps.items()))+". More-specific settings may override earlier values.")
     else: lines.append("No config candidates found in the documented/custom/global/project locations inspected.")
-    lines += ["- OpenCode supports merged config layers. Deprecated schema fields are reported rather than treated as invalid; current docs and schema can expose different generations of examples. This tool does not call `opencode debug config`, because its output may expose sensitive values.",""]
+    lines += ["- OpenCode supports merged config layers. When `debug config` succeeds, the installed CLI's resolved configuration drives capability and permission analysis. The live schema is advisory and may lag; unknown/deprecated/type schema-only warnings are suppressed when that exact key is retained by the installed CLI. Static source files are still checked for syntax and parse problems.",""]
     lines += ["## Configuration detail (sensitive values withheld)",""]
     models=safe_model_info(merged)
     lines.extend("- "+line for line in models) if models else lines.append("- No model/provider IDs visible in parsed config; Desktop account/session model selection may be stored elsewhere.")
@@ -660,7 +728,7 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
             lines.append(f"  - {language}: "+(", ".join(f"`{name}`" for name in present) if present else "none of the checked common tools"))
     lines += ["", "## Runtime MCP check", ""]
     if not mcp_runtime["requested"]:
-        lines.append("Not run. The default audit is static; pass `--check-mcp` to explicitly execute `opencode mcp list`.")
+        lines.append("Not run. Pass `--check-mcp` to explicitly execute `opencode mcp list`; the resolved-config check above does not test server connectivity.")
     else:
         lines.append(f"Opt-in check: {mcp_runtime['status']}; return code: {mcp_runtime['returncode'] if mcp_runtime['returncode'] is not None else 'not available'}.")
         if mcp_runtime["servers"]:
@@ -674,7 +742,7 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
             lines += [f"### {i}. [{item['severity']}] {item['title']}","",f"- Evidence: {item['evidence']}",f"- Why it matters: {item['impact']}",f"- Recommended next step: {item['action']}",f"- Official source: {item['source']}",""]
     lines += ["## Official source retrieval",""]
     lines.extend(f"- [{name}]({url}) — fetched" if name in docs else f"- [{name}]({url}) — unavailable: {doc_errors.get(name,'not checked')[:140]}" for name,url in base.DOCS.items())
-    lines += [f"- [Config JSON Schema]({SCHEMA_URL}) — {'fetched for top-level key/type checks' if schema_ok else 'not available; no full schema validation performed'}", "", "## Scope and safeguards", "", "- Static analysis is the default. The optional `--check-mcp` launches `opencode mcp list`, which may start local MCP processes or contact remote endpoints; raw stdout/stderr is discarded and no configuration is changed.", "- Secret values are never printed. The report may show non-secret identifiers such as model names, MCP server IDs, agent names, and permission decisions; review the report before sharing it.", "- The audit does not inspect OpenCode's private Desktop database, authentication store, active UI model, remote policy, inline config contents, or all environment variables.", "- A missing config field may be inherited from OpenCode defaults. Explicit setting detection is not the same as effective runtime behavior.", "- Every suggested change requires human approval and should be tested on a disposable project.", ""]
+    lines += [f"- [Config JSON Schema]({SCHEMA_URL}) — {'fetched for top-level key/type checks' if schema_ok else 'not available; no full schema validation performed'}", "", "## Scope and safeguards", "", "- `opencode debug config` runs by default when a CLI is available to show resolved settings; it may load remote config supported by the installed build. Raw stdout/stderr are discarded and credential-like values are redacted before analysis. Use `--skip-debug-config` for static-only review.","- The optional `--check-mcp` launches `opencode mcp list`, which may start local MCP processes or contact remote endpoints; it is not run by default.", "- Secret values are never printed. The report may show non-secret identifiers such as model names, MCP server IDs, agent names, and permission decisions; review the report before sharing it.", "- The audit does not inspect OpenCode's private Desktop database, authentication store, active UI model, remote policy, inline config contents, or all environment variables.", "- A missing config field may be inherited from OpenCode defaults. Explicit setting detection is not the same as effective runtime behavior.", "- Every suggested change requires human approval and should be tested on a disposable project.", ""]
     return "\n".join(lines)
 
 
@@ -685,8 +753,10 @@ def main():
     parser.add_argument("--offline",action="store_true",help="Skip all official web/schema checks")
     parser.add_argument("--global-only",action="store_true",help="Inspect user-level OpenCode config only; do not scan project files")
     parser.add_argument("--check-mcp",action="store_true",help="Opt in to `opencode mcp list`; may start local servers or contact remote endpoints")
+    parser.add_argument("--cli",help="Path to the OpenCode CLI executable; defaults to OPENCODE_CLI or PATH lookup")
+    parser.add_argument("--skip-debug-config",action="store_true",help="Do not invoke `opencode debug config`; use static file analysis only")
     args=parser.parse_args()
-    report=create_report(Path(args.project_dir).expanduser().resolve(),args.offline,args.global_only,args.check_mcp)
+    report=create_report(Path(args.project_dir).expanduser().resolve(),args.offline,args.global_only,args.check_mcp,not args.skip_debug_config,args.cli)
     if args.output:
         target=Path(args.output).expanduser().resolve(); target.parent.mkdir(parents=True,exist_ok=True); target.write_text(report,encoding="utf-8"); print(f"Report saved to {target}")
     else: print(report)

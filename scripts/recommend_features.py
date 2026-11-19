@@ -16,6 +16,7 @@ import urllib.request
 
 DOCS = {
     "Configuration": "https://opencode.ai/docs/config/",
+    "CLI commands": "https://opencode.ai/docs/cli/commands/",
     "Agents": "https://opencode.ai/docs/agents/",
     "Skills": "https://opencode.ai/docs/skills/",
     "MCP servers": "https://opencode.ai/docs/mcp-servers/",

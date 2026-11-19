@@ -117,6 +117,42 @@ class DeepAuditTests(unittest.TestCase):
         self.assertEqual(audit.safe_label("bash"),"bash")
         self.assertEqual(audit.safe_label("https://user:pass@example.org"),"[redacted]")
 
+    def test_debug_config_parses_resolved_json_and_redacts_secrets(self):
+        self.assertEqual(audit.parse_debug_config_output("{}"),{})
+        text='Loaded config:\n'+json.dumps({"$schema":"https://opencode.ai/config.json","model":"provider/model","provider":{"provider":{"options":{"apiKey":"never-print-me"}}},"mcp":{"servers":{"docs":{"type":"remote","url":"https://example.test"}}}})
+        parsed=audit.parse_debug_config_output(text)
+        self.assertEqual(parsed["model"],"provider/model")
+        self.assertEqual(parsed["provider"]["provider"]["options"]["apiKey"],"[redacted]")
+        self.assertNotIn("never-print-me",json.dumps(parsed))
+
+    def test_resolved_cli_config_suppresses_stale_schema_unknown_key_warning(self):
+        with tempfile.TemporaryDirectory() as td:
+            home=Path(td); config_dir=home/".config"/"opencode"; config_dir.mkdir(parents=True)
+            (config_dir/"opencode.json").write_text('{"future_feature": true}',encoding="utf-8")
+            with patch.dict(os.environ,{"XDG_CONFIG_HOME":str(home/".config"),"HOME":str(home)},clear=False), \
+                 patch.object(audit.base,"detect_version",return_value=("v2.3.4","test")), \
+                 patch.object(audit,"debug_config",return_value={"status":"resolved config loaded from installed CLI","config":{"future_feature":True,"model":"provider/model"},"version":"v2.3.4"}), \
+                 patch.object(audit,"source_roots",return_value=[]), \
+                 patch.object(audit,"inventory_files",return_value=([],[],[],[],[])), \
+                 patch.object(audit,"skill_roots",return_value=[]), \
+                 patch.object(audit,"configured_skill_roots",return_value=([],0)), \
+                 patch.object(audit,"fetch_schema",return_value=({"properties":{"model":{"type":"string"}}},None)), \
+                 patch.object(audit.base,"fetch_text",return_value=(None,"offline test")):
+                report=audit.create_report(home,global_only=True)
+            self.assertIn("installed CLI debug config",report)
+            self.assertNotIn("Config key not found in current official schema: future_feature",report)
+            self.assertIn("provider/model",report)
+
+    def test_debug_config_uses_selected_cli_and_falls_back_without_raw_error(self):
+        version=audit.subprocess.CompletedProcess(args=[],returncode=0,stdout="v2.3.4\n",stderr="")
+        error=audit.subprocess.CompletedProcess(args=[],returncode=1,stdout="",stderr="token=do-not-show")
+        with patch.object(audit.subprocess,"run",side_effect=[version,error]) as run:
+            result=audit.debug_config(Path("."),cli_path="C:/Program Files/OpenCode/opencode.exe")
+        self.assertEqual(result["version"],"v2.3.4")
+        self.assertIsNone(result["config"])
+        self.assertNotIn("do-not-show",json.dumps(result))
+        self.assertEqual(run.call_args_list[1].args[0], ["C:/Program Files/OpenCode/opencode.exe","debug","config"])
+
     def test_runtime_check_is_opt_in_and_discards_raw_output(self):
         completed=audit.subprocess.CompletedProcess(
             args=["opencode","mcp","list"],returncode=0,
@@ -146,6 +182,7 @@ class DeepAuditTests(unittest.TestCase):
             self.assertNotIn("VERY_SECRET",report)
             self.assertNotIn("password@example.org",report)
             self.assertIn("not run",report.casefold())
+            self.assertIn("installed CLI `debug config` is the primary",report)
 
 
 if __name__=="__main__":
