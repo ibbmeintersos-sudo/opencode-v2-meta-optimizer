@@ -138,10 +138,13 @@ class DeepAuditTests(unittest.TestCase):
                  patch.object(audit,"configured_skill_roots",return_value=([],0)), \
                  patch.object(audit,"fetch_schema",return_value=({"properties":{"model":{"type":"string"}}},None)), \
                  patch.object(audit.base,"fetch_text",return_value=("v2.3.2",None)), \
-                 patch.object(audit.base,"collect_official_source_data",return_value={"website":{"ok":True},"docs_inventory":{"ok":True,"item_count":69},"github_repo":{"ok":True,"full_name":"anomalyco/opencode","default_branch":"dev"},"github_readme":{"ok":True,"sha":"abc","size":100,"headings":["OpenCode"]},"github_releases":{"ok":True,"latest_v2":{"version":"v2.3.2","url":"https://github.com/anomalyco/opencode/releases/tag/v2.3.2","published_at":"2026-11-18T01:35:12Z"},"records_read":20,"pages_read":1,"scan_complete":True}}):
+                 patch.object(audit.base,"collect_official_source_data",return_value={"website":{"ok":True},"docs_inventory":{"ok":True,"item_count":69},"github_repo":{"ok":True,"full_name":"anomalyco/opencode","default_branch":"dev"},"github_readme":{"ok":True,"sha":"abc","size":100,"headings":["OpenCode"]},"github_releases":{"ok":True,"latest_v2":{"version":"v2.3.2","url":"https://github.com/anomalyco/opencode/releases/tag/v2.3.2","published_at":"2026-11-18T01:35:12Z"},"records_read":20,"pages_read":1,"scan_complete":True}}), \
+                 patch.object(audit.base,"collect_v2_documentation",return_value={"status":"complete","version":"v2.3.2","files":[{"title":"V2 Config","url":"https://github.com/anomalyco/opencode/blob/v2.3.2/services/site/src/docs/content/config.mdx","kind":"release documentation"}],"selected_count":1,"downloaded_count":1,"docs_count":1,"spec_count":0,"failed_count":0}):
                 report=audit.create_report(home,global_only=True)
             self.assertIn("installed CLI debug config",report)
             self.assertIn("Additional official sources",report)
+            self.assertIn("GitHub v2 documentation",report)
+            self.assertIn("Fetched from official OpenCode GitHub tag `v2.3.2`",report)
             self.assertIn("Latest stable v2 candidate from GitHub Releases: **v2.3.2**",report)
             self.assertIn("v2 release corroboration: **confirmed by changelog and complete Releases scan**",report)
             self.assertNotIn("Config key not found in current official schema: future_feature",report)

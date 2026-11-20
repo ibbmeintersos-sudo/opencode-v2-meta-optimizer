@@ -51,3 +51,11 @@ Latest stable v2 is selected from GitHub Releases records whose tags match `v2.<
 The official Discord shortcut is shown as a manual community link only; the auditor does not join, log in, or read private channels. `x.com/opencode` is shown as a user-provided announcement link; ownership is not independently verified and X is not scraped or treated as the canonical release source.
 
 Sources: <https://opencode.ai/> · <https://opencode.ai/docs/llms.txt> · <https://opencode.ai/changelog> · <https://github.com/anomalyco/opencode> · <https://github.com/anomalyco/opencode/releases> · <https://api.github.com/repos/anomalyco/opencode/releases?per_page=20&page=1> · <https://opencode.ai/discord> · <https://x.com/opencode>
+
+## Release-pinned v2 documentation retrieval
+
+After the stable-v2 candidate is selected from the public Releases API, the audit requests only two directory listings at that exact tag: `services/site/src/docs/content` and `specs/v2`. It accepts an explicit allowlist of core documentation topics (agents, commands, compaction, config, formatters, instructions, MCP, migration, models, permissions, plugins, policies, providers, skills, snapshots, and tools), plus Markdown/MDX files directly under `specs/v2`. It then retrieves those files from `raw.githubusercontent.com/anomalyco/opencode/<tag>/...`. It does not use the moving `dev` branch for this release-specific set.
+
+Safety bounds: public unauthenticated HTTPS only, fixed repository/paths, semver-validated v2 tag, at most 40 files, 250 KB per file, eight concurrent raw-file requests. Bodies remain in memory; only titles, links, counts, and retrieval status are included in the Markdown report. Offline mode skips these requests. Incomplete manifests or individual file failures produce an unavailable/partial status. This is a focused core-doc set, not a claim that every web page in the repository was downloaded.
+
+Sources: <https://github.com/anomalyco/opencode> · <https://github.com/anomalyco/opencode/tree/v2.3.2/services/site/src/docs/content> · <https://github.com/anomalyco/opencode/tree/v2.3.2/specs/v2> · <https://opencode.ai/docs/migrate-v1/>

@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 import base64
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import datetime as dt
 import html
 from html.parser import HTMLParser
@@ -46,6 +47,16 @@ GITHUB_RELEASES_API = f"https://api.github.com/repos/anomalyco/opencode/releases
 GITHUB_REPO_API = "https://api.github.com/repos/anomalyco/opencode"
 MAX_RELEASE_PAGES = 5
 MAX_SOURCE_BYTES = 2_000_000
+MAX_V2_DOC_BYTES = 250_000
+MAX_V2_DOC_FILES = 40
+GITHUB_CONTENTS_API = "https://api.github.com/repos/anomalyco/opencode/contents/"
+GITHUB_RAW_BASE = "https://raw.githubusercontent.com/anomalyco/opencode/"
+V2_DOCS_ROOT = "services/site/src/docs/content/"
+V2_CORE_DOC_NAMES = {
+    "agents.mdx", "commands.mdx", "compaction.mdx", "config.mdx", "formatters.mdx",
+    "instructions.mdx", "mcp-servers.mdx", "migrate-v1.mdx", "models.mdx", "permissions.mdx",
+    "plugins.mdx", "policies.mdx", "providers.mdx", "skills.mdx", "snapshots.mdx", "tools.mdx",
+}
 
 FEATURES = [
     {"id":"permissions", "title":"Agent-specific least-privilege permissions", "need":"agents", "summary":"Use per-agent permissions so read-only reviewers cannot edit files or run shell commands.", "benefit":"Reduces accidental changes and limits the impact of a misdirected agent.", "risk":"Overly restrictive rules can block legitimate work; verify the resolved config and test in a disposable project.", "source":"Agents"},
@@ -168,6 +179,103 @@ def collect_official_source_data():
     }
 
 
+def fetch_raw_text(url: str, timeout: float = 12.0) -> tuple[str|None,str|None]:
+    """Fetch only bounded public files from the fixed official OpenCode GitHub raw host."""
+    if not url.startswith(GITHUB_RAW_BASE):
+        return None,"untrusted source URL"
+    request=urllib.request.Request(url,headers={"User-Agent":"OpenCode-v2-Meta-Optimizer/0.6 (version-pinned public docs)","Accept":"text/plain"})
+    try:
+        with urllib.request.urlopen(request,timeout=timeout) as response:
+            raw=response.read(MAX_V2_DOC_BYTES+1)
+        if len(raw)>MAX_V2_DOC_BYTES: return None,"document exceeded size limit"
+        return raw.decode("utf-8","replace"),None
+    except urllib.error.HTTPError as exc:
+        return None,f"HTTP {exc.code}"
+    except (urllib.error.URLError,TimeoutError,OSError,ValueError) as exc:
+        return None,type(exc).__name__
+
+
+def _v2_doc_record(path: str, text: str, tag: str) -> dict:
+    headings=[re.sub(r"[^A-Za-z0-9 .()&/+_:#-]","",m.group(1)).strip()[:120] for m in re.finditer(r"^#{1,3}\s+(.+?)\s*#*\s*$",text,re.M)][:8]
+    frontmatter=re.search(r"\A---\s*\n(.*?)\n---",text,re.S)
+    title_match=re.search(r"^title:\s*[\"']?(.+?)[\"']?\s*$",frontmatter.group(1),re.M) if frontmatter else None
+    title=(title_match.group(1).strip() if title_match else (headings[0] if headings else Path(path).name))
+    quoted_path=urllib.parse.quote(path,safe="/._-")
+    quoted_tag=urllib.parse.quote(tag,safe=".")
+    kind="v2 specification" if path.startswith("specs/v2/") else "release documentation"
+    return {"path":path,"kind":kind,"title":title,"headings":headings,"characters":len(text),"url":f"https://github.com/anomalyco/opencode/blob/{quoted_tag}/{quoted_path}"}
+
+
+def collect_v2_documentation(release_data: dict|None) -> dict:
+    """Fetch core website docs and all v2 specs from the latest stable v2 release tag.
+
+    Two small GitHub Contents API listings provide the manifest; file bodies are fetched
+    from fixed raw GitHub URLs concurrently, bounded in count/size, and never written to disk.
+    """
+    candidate=(release_data or {}).get("latest_v2") if isinstance(release_data,dict) else None
+    if not isinstance(candidate,dict) or not version_tuple(candidate.get("version","")):
+        return {"status":"unavailable","error":"no stable v2 release candidate","version":None,"files":[],"manifest_count":0,"selected_count":0,"downloaded_count":0,"spec_count":0,"docs_count":0}
+    tag=candidate["version"]
+    encoded_tag=urllib.parse.quote(tag,safe=".")
+    root=urllib.parse.quote(V2_DOCS_ROOT.rstrip("/"),safe="/._-")
+    spec_root="specs/v2"
+    docs_listing,docs_error,docs_meta=fetch_json(f"{GITHUB_CONTENTS_API}{root}?ref={encoded_tag}",timeout=20)
+    specs_listing,specs_error,specs_meta=fetch_json(f"{GITHUB_CONTENTS_API}{spec_root}?ref={encoded_tag}",timeout=20)
+    errors=[error for error in (docs_error,specs_error) if error]
+    if not isinstance(docs_listing,list) or not isinstance(specs_listing,list):
+        return {"status":"unavailable","error":"; ".join(errors) or "unexpected GitHub Contents API response","version":tag,"files":[],"manifest_count":0,"selected_count":0,"downloaded_count":0,"spec_count":0,"docs_count":0}
+    manifest=[]
+    for entry in docs_listing:
+        if isinstance(entry,dict) and entry.get("type")=="file" and entry.get("name") in V2_CORE_DOC_NAMES and entry.get("name"," ").endswith(".mdx"):
+            path=entry.get("path")
+            if isinstance(path,str) and path.startswith(V2_DOCS_ROOT): manifest.append(path)
+    for entry in specs_listing:
+        if isinstance(entry,dict) and entry.get("type")=="file" and entry.get("name","").endswith((".md",".mdx")):
+            path=entry.get("path")
+            if isinstance(path,str) and path.startswith("specs/v2/"): manifest.append(path)
+    manifest=sorted(set(manifest))
+    selected=manifest[:MAX_V2_DOC_FILES]
+    if not selected:
+        return {"status":"unavailable","error":"no supported core docs or v2 specs found in tagged directories","version":tag,"files":[],"manifest_count":len(manifest),"selected_count":0,"downloaded_count":0,"spec_count":0,"docs_count":0}
+    def read_one(path):
+        url=GITHUB_RAW_BASE+encoded_tag+"/"+urllib.parse.quote(path,safe="/._-")
+        text,fetch_error=fetch_raw_text(url)
+        return path,text,fetch_error
+    results=[]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures=[pool.submit(read_one,path) for path in selected]
+        for future in as_completed(futures): results.append(future.result())
+    records=[]; failures=[]
+    for path,text,fetch_error in sorted(results):
+        if text is None:
+            failures.append({"path":path,"error":fetch_error or "unavailable"})
+        else:
+            records.append(_v2_doc_record(path,text,tag))
+    specs=sum(1 for item in records if item["kind"]=="v2 specification")
+    docs=len(records)-specs
+    complete=not failures and len(selected)==len(manifest)
+    status="complete" if complete else "partial"
+    if errors: status="partial"
+    return {"status":status,"error":"; ".join(errors) if errors else None,"version":tag,"tag_url":f"https://github.com/anomalyco/opencode/tree/{encoded_tag}","files":records,"manifest_count":len(manifest),"selected_count":len(selected),"downloaded_count":len(records),"spec_count":specs,"docs_count":docs,"failed_count":len(failures),"failures":failures[:10],"complete":complete and not errors,"contents_meta":{"docs":docs_meta,"specs":specs_meta}}
+
+
+def render_v2_docs_section(data: dict|None, limit=20) -> list[str]:
+    if not isinstance(data,dict) or data.get("status") in (None,"unavailable","not checked offline"):
+        status=data.get("status","unavailable") if isinstance(data,dict) else "unavailable"
+        detail=data.get("error") if isinstance(data,dict) else None
+        return ["## GitHub v2 documentation", "", f"Version-pinned GitHub docs: **{status}**"+(f" ({detail})" if detail else "")+".",""]
+    files=data.get("files",[])
+    lines=["## GitHub v2 documentation", "", f"Fetched from official OpenCode GitHub tag `{data.get('version','unknown')}`: **{data.get('downloaded_count',0)}/{data.get('manifest_count',data.get('selected_count',0))} files** ({data.get('docs_count',0)} core docs, {data.get('spec_count',0)} v2 specifications); status: **{data.get('status')}**. Sources are pinned to the release tag, not the moving development branch. File contents are inspected in memory only and are not saved or sent to an AI service."]
+    for item in files[:limit]:
+        title=html.escape(str(item.get("title") or item.get("path") or "document"))
+        lines.append(f"- [{title}]({item['url']}) — {item['kind']}")
+    if len(files)>limit: lines.append(f"- {len(files)-limit} additional fetched document(s) omitted from this report index.")
+    if data.get("failed_count"): lines.append(f"- {data['failed_count']} selected source file(s) could not be retrieved; this is a partial documentation fetch.")
+    if data.get("selected_count",0)>=MAX_V2_DOC_FILES and data.get("manifest_count",0)>data.get("selected_count",0): lines.append("- The safety file-count limit was reached; this fetch may not include every candidate document.")
+    lines.append("")
+    return lines
+
+
 def source_error(status):
     return "available" if status.get("ok") else "unavailable"+(": "+str(status.get("error")) if status.get("error") else "")
 
@@ -271,6 +379,7 @@ def build_report(project_dir: Path, offline: bool=False) -> str:
     release=latest_changelog_version(results.get("Changelog"))
     source_data=collect_official_source_data() if not offline else {"website":{"ok":False,"error":"offline mode"},"docs_inventory":{"ok":False,"error":"offline mode"},"github_repo":{"ok":False,"error":"offline mode"},"github_readme":{"ok":False,"error":"offline mode"},"github_releases":{"ok":False,"error":"offline mode","latest_v2":None,"records_read":0,"pages_read":0,"scan_complete":False},"discord":{"status":"not checked offline","url":OFFICIAL_SOURCES["Discord invite"]},"x":{"status":"not checked offline","url":OFFICIAL_SOURCES["X account"]}}
     github_v2=source_data["github_releases"].get("latest_v2")
+    v2_docs=collect_v2_documentation(source_data.get("github_releases")) if not offline else {"status":"not checked offline","error":"offline mode","files":[],"version":None,"selected_count":0,"downloaded_count":0,"spec_count":0,"docs_count":0}
     changelog_v2=latest_changelog_v2_version(results.get("Changelog"))
     release_values_agree=bool(github_v2 and changelog_v2==github_v2.get("version"))
     changelog_confirms=bool(release_values_agree and source_data["github_releases"].get("scan_complete"))
@@ -289,7 +398,9 @@ def build_report(project_dir: Path, offline: bool=False) -> str:
             lines.append(f"GitHub Releases API candidate `{github_v2['version']}` does not match the changelog's first v2 label `{changelog_v2 or 'unavailable'}` (overall first release label: `{release or 'unavailable'}`). Treat the API tag as a candidate; verify the release page and notes before calling it confirmed latest.")
     else:
         lines.append("No stable v2 release could be verified from the official public Releases API in this run. The tool will not substitute a search result, Discord/X announcement, or unrelated latest endpoint.")
-    lines += ["", "## Recommendations", ""]
+    lines += [""]
+    lines += render_v2_docs_section(v2_docs)
+    lines += ["## Recommendations", ""]
     for feature in FEATURES:
         if feature["source"] not in results:
             continue

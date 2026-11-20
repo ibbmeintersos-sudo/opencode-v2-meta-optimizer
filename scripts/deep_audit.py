@@ -646,6 +646,7 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
     current=base.latest_changelog_version(docs.get("Changelog"))
     changelog_v2=base.latest_changelog_v2_version(docs.get("Changelog"))
     source_data=base.collect_official_source_data() if not offline else None
+    v2_docs=base.collect_v2_documentation(source_data.get("github_releases")) if source_data else {"status":"not checked offline","error":"offline mode","files":[],"version":None,"selected_count":0,"downloaded_count":0,"spec_count":0,"docs_count":0}
     github_v2=(source_data or {}).get("github_releases",{}).get("latest_v2")
     release_values_agree=bool(github_v2 and changelog_v2==github_v2.get("version"))
     release_sources_agree=bool(release_values_agree and source_data and source_data["github_releases"].get("scan_complete"))
@@ -752,6 +753,7 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
     lines += ["## Official source retrieval",""]
     lines.extend(f"- [{name}]({url}) — fetched" if name in docs else f"- [{name}]({url}) — unavailable: {doc_errors.get(name,'not checked')[:140]}" for name,url in base.DOCS.items())
     lines += [f"- [Config JSON Schema]({SCHEMA_URL}) — {'fetched for top-level key/type checks' if schema_ok else 'not available; no full schema validation performed'}"]
+    lines += base.render_v2_docs_section(v2_docs)
     lines += ["", "### Additional official sources", "",f"Checked at: {dt.datetime.now(dt.timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} (retrieval time)."]
     if source_data:
         lines.append(f"- [OpenCode website]({base.OFFICIAL_SOURCES['OpenCode website']}) — {base.source_error(source_data['website'])}; navigation source, not version authority.")

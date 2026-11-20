@@ -43,6 +43,41 @@ class FeatureReportTests(unittest.TestCase):
         self.assertIn("not crawled",sources["discord"]["status"])
         self.assertIn("not independently verified",sources["x"]["status"])
 
+    def test_v2_docs_fetches_core_docs_and_specs_from_latest_release_tag(self):
+        docs=[
+            {"path":"services/site/src/docs/content/config.mdx","name":"config.mdx","type":"file"},
+            {"path":"services/site/src/docs/content/migrate-v1.mdx","name":"migrate-v1.mdx","type":"file"},
+            {"path":"services/site/src/docs/content/irrelevant.mdx","name":"irrelevant.mdx","type":"file"},
+        ]
+        specs=[{"path":"specs/v2/tools.md","name":"tools.md","type":"file"}]
+        calls=[]
+        def api(url,timeout=15.0):
+            calls.append(url)
+            return (docs if "services/site/src/docs/content" in url else specs,None,{})
+        raw_calls=[]
+        def raw(url):
+            raw_calls.append(url)
+            return ("# Config Guide\n## Permissions\nBody",None)
+        with patch.object(module,"fetch_json",side_effect=api), patch.object(module,"fetch_raw_text",side_effect=raw):
+            result=module.collect_v2_documentation({"latest_v2":{"version":"v2.3.2"}})
+        self.assertEqual(result["status"],"complete")
+        self.assertEqual(result["version"],"v2.3.2")
+        self.assertEqual(result["downloaded_count"],3)
+        self.assertEqual(result["manifest_count"],3)
+        self.assertEqual(result["spec_count"],1)
+        self.assertTrue(all("/v2.3.2/" in url for url in raw_calls))
+        self.assertEqual(len(calls),2)
+        self.assertTrue(all("ref=v2.3.2" in url for url in calls))
+        self.assertNotIn("irrelevant.mdx", " ".join(raw_calls))
+
+    def test_v2_docs_fail_closed_for_invalid_or_truncated_manifest(self):
+        no_release=module.collect_v2_documentation({"latest_v2":{"version":"v3.1.0"}})
+        self.assertEqual(no_release["status"],"unavailable")
+        with patch.object(module,"fetch_json",return_value=(None,"HTTP 403",{})):
+            failed=module.collect_v2_documentation({"latest_v2":{"version":"v2.3.2"}})
+        self.assertEqual(failed["status"],"unavailable")
+        self.assertEqual(failed["downloaded_count"],0)
+
     def test_report_discloses_missing_cli_and_keeps_read_only(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -60,7 +95,7 @@ class FeatureReportTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with patch.object(module, "detect_version", return_value=("v2.3.2", "test")), \
                  patch.object(module, "DOCS", {"Agents": "https://opencode.ai/docs/agents/"}), \
-                 patch.object(module, "fetch_text", return_value=("official agents docs", None)), patch.object(module,"collect_official_source_data",return_value={"website":{"ok":False},"docs_inventory":{"ok":False},"github_repo":{"ok":False},"github_readme":{"ok":False},"github_releases":{"ok":False,"latest_v2":None,"records_read":0,"pages_read":0},"discord":{"status":"not checked","url":"https://opencode.ai/discord"},"x":{"status":"not checked","url":"https://x.com/opencode"}}):
+                 patch.object(module, "fetch_text", return_value=("official agents docs", None)), patch.object(module,"collect_official_source_data",return_value={"website":{"ok":False},"docs_inventory":{"ok":False},"github_repo":{"ok":False},"github_readme":{"ok":False},"github_releases":{"ok":False,"latest_v2":None,"records_read":0,"pages_read":0},"discord":{"status":"not checked","url":"https://opencode.ai/discord"},"x":{"status":"not checked","url":"https://x.com/opencode"}}), patch.object(module,"collect_v2_documentation",return_value={"status":"unavailable","error":"no candidate","files":[],"version":None,"selected_count":0,"downloaded_count":0,"spec_count":0,"docs_count":0}):
                 report = module.build_report(Path(tmp))
             self.assertIn("No configuration file was parsed", report)
             self.assertIn("Unknown - no local config was parsed", report)
@@ -96,7 +131,7 @@ class FeatureReportTests(unittest.TestCase):
 
     def test_report_marks_release_disagreement_not_as_confirmed_latest(self):
         source_data={"website":{"ok":True},"docs_inventory":{"ok":True,"item_count":160},"github_repo":{"ok":True,"full_name":"anomalyco/opencode","default_branch":"dev"},"github_readme":{"ok":True,"sha":"abc","size":20,"headings":["OpenCode","Install"]},"github_releases":{"ok":True,"latest_v2":{"version":"v2.3.2","url":"https://github.com/anomalyco/opencode/releases/tag/v2.3.2","published_at":"2026-11-18T01:35:12Z"},"records_read":100,"pages_read":1,"scan_complete":True},"discord":{"status":"manual link","url":"https://opencode.ai/discord"},"x":{"status":"not crawled","url":"https://x.com/opencode"}}
-        with tempfile.TemporaryDirectory() as tmp, patch.object(module,"detect_version",return_value=("v2.3.1","test")), patch.object(module,"DOCS",{"Changelog":"https://opencode.ai/changelog"}), patch.object(module,"fetch_text",return_value=("v2.3.0 v2.2.7",None)), patch.object(module,"collect_official_source_data",return_value=source_data):
+        with tempfile.TemporaryDirectory() as tmp, patch.object(module,"detect_version",return_value=("v2.3.1","test")), patch.object(module,"DOCS",{"Changelog":"https://opencode.ai/changelog"}), patch.object(module,"fetch_text",return_value=("v2.3.0 v2.2.7",None)), patch.object(module,"collect_official_source_data",return_value=source_data), patch.object(module,"collect_v2_documentation",return_value={"status":"partial","version":"v2.3.2","files":[],"selected_count":4,"downloaded_count":3,"spec_count":1,"docs_count":2,"failed_count":1}):
             report=module.build_report(Path(tmp))
         self.assertIn("Latest stable v2 candidate",report)
         self.assertIn("v2.3.2",report)
