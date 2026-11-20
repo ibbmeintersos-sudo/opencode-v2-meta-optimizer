@@ -602,7 +602,7 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
     if debug_result.get("version"):
         version=debug_result["version"]
         version_evidence="detected from the selected CLI used for `debug config`"
-    merged=debug_result["config"] if isinstance(debug_result.get("config"),dict) else static_merged
+    merged=redact_secret_values(debug_result["config"]) if isinstance(debug_result.get("config"),dict) else redact_secret_values(static_merged)
     config_source="installed CLI debug config" if debug_result.get("config") is not None else "static file merge (fallback)"
     roots=source_roots(project_dir,global_only)
     extra_skill_roots,remote_skill_catalogs=configured_skill_roots(merged,project_dir)
@@ -647,6 +647,9 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
     changelog_v2=base.latest_changelog_v2_version(docs.get("Changelog"))
     source_data=base.collect_official_source_data() if not offline else None
     v2_docs=base.collect_v2_documentation(source_data.get("github_releases")) if source_data else {"status":"not checked offline","error":"offline mode","files":[],"version":None,"selected_count":0,"downloaded_count":0,"spec_count":0,"docs_count":0}
+    semantic=base.analyze_v2_configuration(merged,v2_docs,config_source)
+    for item in semantic.get("findings",[]):
+        add_finding(findings,item["severity"],item["code"],item["title"],item["evidence"],item["impact"],item["action"],item["source"])
     github_v2=(source_data or {}).get("github_releases",{}).get("latest_v2")
     release_values_agree=bool(github_v2 and changelog_v2==github_v2.get("version"))
     release_sources_agree=bool(release_values_agree and source_data and source_data["github_releases"].get("scan_complete"))
@@ -745,6 +748,15 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
             lines.extend(f"- `{safe_label(item['name'])}`: {item['status']}" for item in mcp_runtime["servers"])
         else:
             lines.append("No server statuses could be safely parsed; raw CLI output was intentionally discarded.")
+    lines += ["", "## Release-pinned semantic comparison", ""]
+    if semantic.get("status")=="completed":
+        basis="the installed CLI's resolved `debug config`" if config_source=="installed CLI debug config" else "static config-file merge only; treat results as provisional"
+        lines.append(f"Compared locally against the fetched OpenCode v{semantic.get('version','unknown')} migration text, using {basis}. {len(semantic.get('findings',[]))} concrete documented compatibility issue(s) found.")
+        lines.append("Only source-backed legacy mappings or explicitly ignored fields are raised. Findings omit setting values and custom resource identifiers; full document bodies remain in memory and are not written to the report.")
+    elif semantic.get("status")=="partial documentation":
+        lines.append(f"The v{semantic.get('version','unknown')} documentation fetch was partial. Any findings below are limited to the fetched source text; absence of a finding is not evidence of compatibility.")
+    else:
+        lines.append(f"Semantic comparison was not run: {semantic.get('status','unknown')}. No source-backed v2 semantic conclusions can be made from this run.")
     lines += ["", "## Findings and recommended actions", ""]
     if not findings: lines.append("No high-confidence static findings were raised. This does not certify the setup or validate runtime connections.")
     else:

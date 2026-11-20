@@ -65,10 +65,56 @@ class FeatureReportTests(unittest.TestCase):
         self.assertEqual(result["downloaded_count"],3)
         self.assertEqual(result["manifest_count"],3)
         self.assertEqual(result["spec_count"],1)
+        self.assertEqual(result["files"][0]["content"],"# Config Guide\n## Permissions\nBody")
+        self.assertNotIn("Body", "\n".join(module.render_v2_docs_section(result)))
         self.assertTrue(all("/v2.3.2/" in url for url in raw_calls))
         self.assertEqual(len(calls),2)
         self.assertTrue(all("ref=v2.3.2" in url for url in calls))
         self.assertNotIn("irrelevant.mdx", " ".join(raw_calls))
+
+    def test_semantic_comparison_uses_tagged_evidence_for_ignored_and_inverted_fields(self):
+        migration=("The V1 config format remains supported. When both forms set the same canonical value, "
+                   "a valid native V2 value takes precedence. V2 has no native `tail_turns` or `prune` field; "
+                   "both legacy fields are ignored with a warning. V2 groups servers under `mcp.servers`, "
+                   "replaces `enabled` with the inverse `disabled`, and separates timeout purposes.")
+        docs={"status":"complete","complete":True,"version":"v2.3.2","files":[
+            {"path":"services/site/src/docs/content/migrate-v1.mdx","url":"https://github.com/anomalyco/opencode/blob/v2.3.2/services/site/src/docs/content/migrate-v1.mdx","content":migration}
+        ]}
+        config={"agent":{"reviewer":{"prompt":"private prompt"}},"agents":{"reviewer":{"system":"private prompt"}},
+                "compaction":{"tail_turns":8},"mcp":{"servers":{"docs":{"enabled":False,"timeout":30000}}}}
+        result=module.analyze_v2_configuration(config,docs,"installed CLI debug config")
+        codes={item["code"] for item in result["findings"]}
+        self.assertEqual(result["status"],"completed")
+        self.assertIn("V2_COMPACTION_LEGACY_IGNORED",codes)
+        self.assertIn("V2_MCP_ENABLED_INVERSION",codes)
+        self.assertIn("V2_MCP_TIMEOUT_SHAPE",codes)
+        self.assertIn("V2_LEGACY_NATIVE_CONFLICT_AGENT",codes)
+        rendered=json.dumps(result)
+        self.assertNotIn("private prompt",rendered)
+        self.assertNotIn("reviewer",rendered)
+        self.assertIn("v2.3.2",rendered)
+
+    def test_semantic_comparison_is_quiet_without_matching_field_or_documentation(self):
+        evidence="V2 has no native `tail_turns` or `prune` field; both legacy fields are ignored with a warning."
+        docs={"status":"complete","complete":True,"version":"v2.3.2","files":[{"path":"migrate-v1.mdx","content":evidence,"url":"https://github.com/anomalyco/opencode/blob/v2.3.2/migrate-v1.mdx"}]}
+        clean=module.analyze_v2_configuration({"compaction":{"auto":True}},docs)
+        self.assertEqual(clean["findings"],[])
+        unavailable=module.analyze_v2_configuration({"compaction":{"tail_turns":8}},{"status":"unavailable","files":[]})
+        self.assertEqual(unavailable["status"],"release documentation unavailable")
+        self.assertEqual(unavailable["findings"],[])
+
+    def test_semantic_comparison_marks_partial_fetch_and_only_flags_actual_overlap(self):
+        docs={"status":"partial","complete":False,"version":"v2.3.2","files":[{"path":"services/site/src/docs/content/migrate-v1.mdx","content":"When both forms set the same canonical value, a valid native V2 value takes precedence.","url":"https://github.com/anomalyco/opencode/blob/v2.3.2/services/site/src/docs/content/migrate-v1.mdx"}]}
+        no_overlap=module.analyze_v2_configuration({"agent":{"one":{}},"agents":{"two":{}}},docs)
+        self.assertEqual(no_overlap["status"],"partial documentation")
+        self.assertEqual(no_overlap["findings"],[])
+        no_permission_overlap=module.analyze_v2_configuration({"permission":{"bash":"ask"},"permissions":[{"action":"edit","resource":"*","effect":"deny"}]},docs)
+        self.assertEqual(no_permission_overlap["findings"],[])
+        permission_overlap=module.analyze_v2_configuration({"permission":{"bash":"ask"},"permissions":[{"action":"bash","resource":"*","effect":"deny"}]},docs)
+        self.assertEqual([item["code"] for item in permission_overlap["findings"]],["V2_LEGACY_NATIVE_CONFLICT_PERMISSION"])
+        alias_docs={**docs,"files":[{**docs["files"][0],"content":docs["files"][0]["content"]+" `bash` is now `shell`."}]}
+        alias_overlap=module.analyze_v2_configuration({"permission":{"bash":{"git push *":"ask"}},"permissions":[{"action":"shell","resource":"git push *","effect":"deny"}]},alias_docs)
+        self.assertEqual([item["code"] for item in alias_overlap["findings"]],["V2_LEGACY_NATIVE_CONFLICT_PERMISSION"])
 
     def test_v2_docs_fail_closed_for_invalid_or_truncated_manifest(self):
         no_release=module.collect_v2_documentation({"latest_v2":{"version":"v3.1.0"}})

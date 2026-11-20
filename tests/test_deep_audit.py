@@ -131,7 +131,7 @@ class DeepAuditTests(unittest.TestCase):
             (config_dir/"opencode.json").write_text('{"future_feature": true}',encoding="utf-8")
             with patch.dict(os.environ,{"XDG_CONFIG_HOME":str(home/".config"),"HOME":str(home)},clear=False), \
                  patch.object(audit.base,"detect_version",return_value=("v2.3.4","test")), \
-                 patch.object(audit,"debug_config",return_value={"status":"resolved config loaded from installed CLI","config":{"future_feature":True,"model":"provider/model"},"version":"v2.3.4"}), \
+                 patch.object(audit,"debug_config",return_value={"status":"resolved config loaded from installed CLI","config":{"future_feature":True,"model":"provider/model","compaction":{"tail_turns":8},"apiKey":"never-print-semantic-secret"},"version":"v2.3.4"}), \
                  patch.object(audit,"source_roots",return_value=[]), \
                  patch.object(audit,"inventory_files",return_value=([],[],[],[],[])), \
                  patch.object(audit,"skill_roots",return_value=[]), \
@@ -139,7 +139,7 @@ class DeepAuditTests(unittest.TestCase):
                  patch.object(audit,"fetch_schema",return_value=({"properties":{"model":{"type":"string"}}},None)), \
                  patch.object(audit.base,"fetch_text",return_value=("v2.3.2",None)), \
                  patch.object(audit.base,"collect_official_source_data",return_value={"website":{"ok":True},"docs_inventory":{"ok":True,"item_count":69},"github_repo":{"ok":True,"full_name":"anomalyco/opencode","default_branch":"dev"},"github_readme":{"ok":True,"sha":"abc","size":100,"headings":["OpenCode"]},"github_releases":{"ok":True,"latest_v2":{"version":"v2.3.2","url":"https://github.com/anomalyco/opencode/releases/tag/v2.3.2","published_at":"2026-11-18T01:35:12Z"},"records_read":20,"pages_read":1,"scan_complete":True}}), \
-                 patch.object(audit.base,"collect_v2_documentation",return_value={"status":"complete","version":"v2.3.2","files":[{"title":"V2 Config","url":"https://github.com/anomalyco/opencode/blob/v2.3.2/services/site/src/docs/content/config.mdx","kind":"release documentation"}],"selected_count":1,"downloaded_count":1,"docs_count":1,"spec_count":0,"failed_count":0}):
+                 patch.object(audit.base,"collect_v2_documentation",return_value={"status":"complete","complete":True,"version":"v2.3.2","files":[{"path":"services/site/src/docs/content/migrate-v1.mdx","title":"Migrate from V1","url":"https://github.com/anomalyco/opencode/blob/v2.3.2/services/site/src/docs/content/migrate-v1.mdx","kind":"release documentation","content":"V2 has no native `tail_turns` or `prune` field; both legacy fields are ignored with a warning."}],"selected_count":1,"downloaded_count":1,"docs_count":1,"spec_count":0,"failed_count":0}):
                 report=audit.create_report(home,global_only=True)
             self.assertIn("installed CLI debug config",report)
             self.assertIn("Additional official sources",report)
@@ -149,6 +149,10 @@ class DeepAuditTests(unittest.TestCase):
             self.assertIn("v2 release corroboration: **confirmed by changelog and complete Releases scan**",report)
             self.assertNotIn("Config key not found in current official schema: future_feature",report)
             self.assertIn("provider/model",report)
+            self.assertIn("Release-pinned semantic comparison",report)
+            self.assertIn("Legacy compaction options are ignored in this v2 release",report)
+            self.assertIn("installed CLI's resolved `debug config`",report)
+            self.assertNotIn("never-print-semantic-secret",report)
 
     def test_debug_config_uses_selected_cli_and_falls_back_without_raw_error(self):
         version=audit.subprocess.CompletedProcess(args=[],returncode=0,stdout="v2.3.4\n",stderr="")
@@ -190,6 +194,7 @@ class DeepAuditTests(unittest.TestCase):
             self.assertNotIn("password@example.org",report)
             self.assertIn("not run",report.casefold())
             self.assertIn("installed CLI `debug config` is the primary",report)
+            self.assertIn("Semantic comparison was not run",report)
 
 
 if __name__=="__main__":

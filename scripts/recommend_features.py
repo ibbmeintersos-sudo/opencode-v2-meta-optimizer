@@ -203,7 +203,7 @@ def _v2_doc_record(path: str, text: str, tag: str) -> dict:
     quoted_path=urllib.parse.quote(path,safe="/._-")
     quoted_tag=urllib.parse.quote(tag,safe=".")
     kind="v2 specification" if path.startswith("specs/v2/") else "release documentation"
-    return {"path":path,"kind":kind,"title":title,"headings":headings,"characters":len(text),"url":f"https://github.com/anomalyco/opencode/blob/{quoted_tag}/{quoted_path}"}
+    return {"path":path,"kind":kind,"title":title,"headings":headings,"characters":len(text),"url":f"https://github.com/anomalyco/opencode/blob/{quoted_tag}/{quoted_path}","content":text}
 
 
 def collect_v2_documentation(release_data: dict|None) -> dict:
@@ -257,6 +257,72 @@ def collect_v2_documentation(release_data: dict|None) -> dict:
     status="complete" if complete else "partial"
     if errors: status="partial"
     return {"status":status,"error":"; ".join(errors) if errors else None,"version":tag,"tag_url":f"https://github.com/anomalyco/opencode/tree/{encoded_tag}","files":records,"manifest_count":len(manifest),"selected_count":len(selected),"downloaded_count":len(records),"spec_count":specs,"docs_count":docs,"failed_count":len(failures),"failures":failures[:10],"complete":complete and not errors,"contents_meta":{"docs":docs_meta,"specs":specs_meta}}
+
+
+def analyze_v2_configuration(config: dict|None, documentation: dict|None, config_source="static file analysis") -> dict:
+    """Compare visible config structures with explicit migration statements from the pinned docs.
+
+    This is intentionally conservative: it reports only concrete legacy fields that the fetched
+    release documentation says are ignored or map to a behaviorally different V2 field. It never
+    includes config values, names of user-defined resources, or document bodies in findings.
+    """
+    if not isinstance(config,dict) or not config:
+        return {"status":"configuration unavailable","findings":[]}
+    if not isinstance(documentation,dict) or documentation.get("status") not in ("complete","partial"):
+        return {"status":"release documentation unavailable","findings":[]}
+    files=documentation.get("files",[])
+    migration=next((item for item in files if str(item.get("path","")).endswith("/migrate-v1.mdx")),None)
+    if not isinstance(migration,dict) or not isinstance(migration.get("content"),str):
+        return {"status":"migration text unavailable","findings":[]}
+    text=migration["content"]
+    version=documentation.get("version","unknown")
+    findings=[]
+
+    def add(code,title,evidence,impact,action,section):
+        url=migration.get("url",documentation.get("tag_url",""))
+        if section: url += "#"+section
+        findings.append({"code":code,"severity":"Medium","title":title,"evidence":evidence,"impact":impact,"action":action,"source":url,"documentation_version":version,"config_source":config_source})
+
+    compaction=config.get("compaction")
+    if isinstance(compaction,dict) and any(key in compaction for key in ("tail_turns","prune")) and all(token in text for token in ("tail_turns","prune","ignored with a warning")):
+        add("V2_COMPACTION_LEGACY_IGNORED","Legacy compaction options are ignored in this v2 release","The resolved config contains a legacy `tail_turns` or `prune` option; the tagged migration guide says V2 has no native equivalent and ignores both.","The setting may not preserve the intended recent context or pruning behavior.","Review the compaction policy in OpenCode Desktop. If the same goal is needed, test the documented token-budget setting on a copied config; do not assume a one-to-one conversion.","compaction")
+
+    mcp=config.get("mcp")
+    if isinstance(mcp,dict) and "servers" in mcp and isinstance(mcp.get("servers"),dict):
+        legacy_enabled=[]
+        for server in mcp["servers"].values():
+            if isinstance(server,dict) and "enabled" in server: legacy_enabled.append(server)
+        if legacy_enabled and all(token in text for token in ("replaces `enabled` with the inverse `disabled`","disabled")):
+            add("V2_MCP_ENABLED_INVERSION","MCP server uses the legacy enabled flag","At least one configured MCP entry uses `enabled`; the tagged migration guide documents the inverse V2 `disabled` flag.","A mechanical rename without inverting the boolean would change whether a server is active.","Confirm the resolved server state with the installed CLI/Desktop. If migrating, invert the boolean deliberately and test server connectivity; no change is made by this audit.","mcp-servers")
+        if any(isinstance(server,dict) and isinstance(server.get("timeout"),(int,float)) for server in mcp["servers"].values()) and all(token in text for token in ("separates timeout purposes","timeout")):
+            add("V2_MCP_TIMEOUT_SHAPE","MCP timeout uses a single legacy value","A configured MCP server has a numeric timeout; the tagged migration guide describes separate catalog and execution timeout purposes.","A single timeout may not express the distinct limits the native V2 shape supports.","Check whether the current CLI normalizes this value. Only migrate after confirming which timeout behavior you intend to preserve.","mcp-servers")
+
+    # Conflicting old/new root maps have explicit precedence rules; report only the count, never IDs.
+    for old,new,label in (("agent","agents","agent definitions"),("permission","permissions","permission rules"),("snapshot","snapshots","snapshot behavior")):
+        old_value,new_value=config.get(old),config.get(new)
+        if old not in config or new not in config: continue
+        if old=="permission" and isinstance(old_value,dict) and isinstance(new_value,list):
+            aliases={}
+            for legacy,canonical in (("bash","shell"),("task","subagent"),("write","edit"),("patch","edit")):
+                if f"`{legacy}` is now `{canonical}`" in text: aliases[legacy]=canonical
+            old_actions={aliases.get(action,action) for action in old_value}
+            new_actions={item.get("action") for item in new_value if isinstance(item,dict) and isinstance(item.get("action"),str)}
+            overlap=len(old_actions.intersection(new_actions))
+            if not overlap: continue
+        elif isinstance(old_value,dict) and isinstance(new_value,dict):
+            overlap=len(set(old_value).intersection(new_value))
+            if not overlap: continue
+        elif old=="snapshot":
+            if old_value==new_value: continue
+            overlap=1
+        elif old_value == new_value:
+            continue
+        else:
+            continue
+        if "valid native V2 value takes precedence" not in text: continue
+        add("V2_LEGACY_NATIVE_CONFLICT_"+old.upper(),f"Legacy and native V2 {label} are both configured",f"Both `{old}` and `{new}` forms are present, with {overlap} overlapping setting group(s); the tagged migration guide says a valid native V2 value takes precedence.","The effective behavior may differ from what a file-by-file reading suggests, especially if the legacy form is expected to override.","Use `opencode debug config` to confirm the resolved behavior. Consolidate only after backing up and comparing the overlapping rules; the audit does not rewrite either form.","configuration")
+
+    return {"status":"completed" if documentation.get("complete") else "partial documentation","version":version,"config_source":config_source,"findings":findings}
 
 
 def render_v2_docs_section(data: dict|None, limit=20) -> list[str]:
