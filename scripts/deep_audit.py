@@ -3,6 +3,7 @@
 from __future__ import annotations
 import argparse
 import datetime as dt
+import fnmatch
 import json
 import os
 from pathlib import Path
@@ -293,7 +294,7 @@ def inventory_files(roots, extra_skill_roots=None):
     for scope,root in roots:
         for path in (root/"agents").glob("*.md") if (root/"agents").is_dir() else []:
             fm=parse_frontmatter(path)
-            agents.append({"id":path.stem,"scope":scope,"mode":fm.get("mode","unspecified/default"),"description":bool(fm.get("description")),"role_text":fm.get("description",""),"permission":fm.get("_permission",{}),"permissions":fm.get("_permissions",[]),"tools":fm.get("tools"),"model":fm.get("model")})
+            agents.append({"id":path.stem,"scope":scope,"mode":fm.get("mode","unspecified/default"),"description":bool(fm.get("description")),"role_text":fm.get("description",""),"permission":fm.get("_permission",{}),"permissions":fm.get("_permissions",[]),"tools":fm.get("tools"),"model":fm.get("model"),"classification":"custom","definition_source":"file"})
         for path in (root/"commands").glob("*.md") if (root/"commands").is_dir() else []: commands.append(path.stem)
         for path in (root/"plugins").glob("*.js") if (root/"plugins").is_dir() else []: plugins.append(path.name)
         for path in (root/"plugins").glob("*.ts") if (root/"plugins").is_dir() else []: plugins.append(path.name)
@@ -358,41 +359,64 @@ def agent_map(merged):
     return result
 
 
-def configured_agents(merged):
-    """Normalize JSON-defined agents into the same shape as Markdown agents."""
+BUILTIN_AGENT_IDS={"build","plan","general","explore","title","summary","compaction"}
+
+
+def configured_agents(merged, explicit_agent_ids=None, resolved=False):
+    """Normalize configured/resolved agents and distinguish built-ins from overrides."""
     result=[]
+    explicit={str(name) for name in (explicit_agent_ids or set())}
     for name,definition in agent_map(merged).items():
         if not isinstance(definition,dict): continue
         role_text=str(definition.get("description",""))+" "+str(definition.get("system",definition.get("prompt","")))
-        result.append({"id":str(name),"scope":"JSON config","mode":definition.get("mode","unspecified/default"),"description":bool(definition.get("description")),"role_text":role_text,"permission":definition.get("permission",{}) if isinstance(definition.get("permission"),dict) else {},"permissions":definition.get("permissions",[]),"tools":definition.get("tools"),"model":definition.get("model")})
+        agent_id=str(name)
+        is_builtin=agent_id in BUILTIN_AGENT_IDS
+        is_explicit=agent_id in explicit
+        classification="overridden built-in" if is_builtin and is_explicit else "built-in" if is_builtin else "custom"
+        result.append({"id":agent_id,"scope":"resolved CLI config" if resolved else "JSON config","mode":definition.get("mode","unspecified/default"),"description":bool(definition.get("description")),"role_text":role_text,"permission":definition.get("permission",{}) if isinstance(definition.get("permission"),dict) else {},"permissions":definition.get("permissions",[]),"tools":definition.get("tools"),"model":definition.get("model"),"classification":classification,"definition_source":"resolved config" if resolved else "file"})
     return result
 
 
-def permission_decision(entry, tool):
-    """Read legacy maps and current ordered rules; mark narrow allows as mixed."""
+def _resource_matches(pattern, resource):
+    """Match OpenCode permission resource globs without treating unrelated scopes as global."""
+    pattern=str(pattern or "*")
+    resource=str(resource or "*")
+    if pattern in ("*", "**"): return True
+    if resource in ("*", "**"):
+        return pattern in ("*", "**")
+    return fnmatch.fnmatchcase(resource,pattern)
+
+
+def permission_decision_detail(entry, action, resource="*"):
+    """Evaluate v2 action/resource/effect rules in declaration order; the last match wins."""
     legacy=entry.get("permission") if isinstance(entry,dict) else None
-    if isinstance(legacy,dict) and (tool in legacy or "*" in legacy):
-        value=legacy.get(tool,legacy.get("*"))
+    if isinstance(legacy,dict) and (action in legacy or "*" in legacy):
+        value=legacy.get(action,legacy.get("*"))
         if isinstance(value,dict):
-            if any(k!="*" and v=="allow" for k,v in value.items()): return "mixed"
-            return value.get("*", "mixed")
-        return value
+            matches=[(str(k),v) for k,v in value.items() if _resource_matches(k,resource)]
+            if matches: return {"effect":matches[-1][1],"action":action,"resource":matches[-1][0],"order":None,"source":"legacy permission map"}
+            return None
+        return {"effect":value,"action":action,"resource":"*","order":None,"source":"legacy permission map"}
     toggles=entry.get("tools") if isinstance(entry,dict) else None
-    if isinstance(toggles,dict) and (tool in toggles or "*" in toggles):
-        value=toggles.get(tool,toggles.get("*"))
-        if value is False: return "deny"
-        if value is True: return "allow"
+    if isinstance(toggles,dict) and (action in toggles or "*" in toggles):
+        value=toggles.get(action,toggles.get("*"))
+        if value is False: return {"effect":"deny","action":action,"resource":"*","order":None,"source":"legacy tools toggle"}
+        if value is True: return {"effect":"allow","action":action,"resource":"*","order":None,"source":"legacy tools toggle"}
     rules=entry.get("permissions") if isinstance(entry,dict) else None
-    universal=[]; specific_allow=False
+    matched=[]
     if isinstance(rules,list):
-        for rule in rules:
+        for index,rule in enumerate(rules,1):
             if not isinstance(rule,dict): continue
-            action=str(rule.get("action","")); resource=str(rule.get("resource",""))
-            if action not in (tool,"*"): continue
-            if resource in ("*","**",tool): universal.append(rule.get("effect"))
-            elif rule.get("effect")=="allow": specific_allow=True
-    if specific_allow: return "mixed"
-    return universal[-1] if universal else None
+            rule_action=str(rule.get("action","")); rule_resource=str(rule.get("resource","*"))
+            if rule_action not in (action,"*") or not _resource_matches(rule_resource,resource): continue
+            matched.append({"effect":rule.get("effect"),"action":rule_action,"resource":rule_resource,"order":index,"source":"v2 permissions"})
+    return matched[-1] if matched else None
+
+
+def permission_decision(entry, tool, resource="*"):
+    """Compatibility wrapper returning the final effect, if a rule matches."""
+    detail=permission_decision_detail(entry,tool,resource)
+    return detail.get("effect") if detail else None
 
 
 def global_permission_decision(perms, tool):
@@ -405,11 +429,42 @@ def global_permission_decision(perms, tool):
     return permission_decision({"permissions":perms},tool)
 
 
+def safe_resource_label(value):
+    """Keep simple policy resources useful while withholding paths and credential-like text."""
+    text=str(value or "*")
+    if is_secret_key(text) or re.search(r"(?:token|secret|password|key)=",text,re.I): return "[redacted resource]"
+    if "://" in text or "\\" in text or "/" in text: return "[path/resource pattern]"
+    return safe_label(text)
+
+
 def permission_rules(merged):
     value=merged.get("permissions")
     if isinstance(value,list): return value
     legacy=merged.get("permission")
     return legacy if isinstance(legacy,dict) else {}
+
+
+def effective_agent_permission(agent, global_rules, action, resource="*"):
+    """Evaluate visible global rules followed by agent-scoped rules, preserving order."""
+    combined=[]
+    if isinstance(global_rules,list):
+        combined.extend(global_rules)
+    elif isinstance(global_rules,dict):
+        for rule_action,value in global_rules.items():
+            if isinstance(value,dict):
+                combined.extend({"action":rule_action,"resource":pattern,"effect":effect} for pattern,effect in value.items())
+            else:
+                combined.append({"action":rule_action,"resource":"*","effect":value})
+    agent_rules=agent.get("permissions")
+    if isinstance(agent_rules,list): combined.extend(agent_rules)
+    agent_legacy=agent.get("permission")
+    if isinstance(agent_legacy,dict):
+        for rule_action,value in agent_legacy.items():
+            if isinstance(value,dict):
+                combined.extend({"action":rule_action,"resource":pattern,"effect":effect} for pattern,effect in value.items())
+            else:
+                combined.append({"action":rule_action,"resource":"*","effect":value})
+    return permission_decision({"permissions":combined},action,resource)
 
 
 def add_finding(findings,severity,code,title,evidence,impact,action,source):
@@ -448,24 +503,35 @@ def analyze(records, merged, agents, skills, commands, plugins, project_dir, sch
             resource=str(rule.get("resource",""))
             if resource=="*" or resource.startswith(("mcp:","skill:","plugin:")):
                 add_finding(findings,"Medium","INTEGRATION_POLICY_SCOPE_CHANGED","Check the scope of an `integration.use` rule", "The rule uses a broad resource or a legacy MCP/Skill/Plugin resource prefix.","Recent changelog notes say `integration.use` now applies to integration accounts only; MCP servers, Skills, and Plugins use separate `mcp.use`, `skill.use`, and `plugin.use` actions. A broad integration rule may no longer constrain those resources.","If you intended to restrict MCP/Skills/Plugins, inspect the installed release’s policy migration and define the corresponding explicit actions; verify against the exact build before changing it.","https://opencode.ai/changelog")
-    for tool in ("bash","edit","external_directory"):
+    for tool in ("shell","edit","external_directory"):
         value=global_permission_decision(perms,tool)
         if value=="allow":
-            add_finding(findings,"High" if tool in ("bash","edit") else "Medium","BROAD_PERMISSION",f"Global `{tool}` permission is allow",f"The visible config contains a broad global `{tool}: allow` rule.","The capability may be available without approval for actions not matched by a later/narrower denial.","Review whether this is intentional; prefer scoped approvals or per-agent restrictions for read-only roles.",base.DOCS["Tools and permissions"])
+            add_finding(findings,"High" if tool in ("shell","edit") else "Medium","BROAD_PERMISSION",f"Global `{tool}` permission is allow",f"The visible config contains a broad global `{tool}: allow` rule.","The capability may be available without approval for actions not matched by a later/narrower denial.","Review whether this is intentional; prefer scoped approvals or per-agent restrictions for read-only roles.",base.DOCS["Tools and permissions"])
     agent_ids={}
-    for agent in agents: agent_ids.setdefault(agent["id"],[]).append(agent["scope"])
+    for agent in agents:
+        if agent.get("classification")=="built-in": continue
+        agent_ids.setdefault(agent["id"],[]).append(agent["scope"])
     for agent_id,scopes in agent_ids.items():
         if len(scopes)>1:
             add_finding(findings,"Medium","DUPLICATE_AGENT_ID",f"Agent ID {safe_label(agent_id)} exists in multiple sources",f"The ID is present in {', '.join(safe_label(scope) for scope in scopes)}.","The active definition may depend on OpenCode source precedence, so the displayed rules may not be the definition selected by Desktop.","Keep IDs unique unless overriding is deliberate; confirm which definition is loaded in the installed build.",base.DOCS["Agents"])
     for agent in agents:
+        classification=agent.get("classification","custom")
+        if classification=="built-in":
+            continue
         role=(agent["id"]+" "+str(agent.get("role_text",""))).casefold()
         likely_readonly=any(word in role for word in ("review","audit","read-only","readonly","explore","research"))
         if agent.get("tools"):
-            add_finding(findings,"Medium","AGENT_LEGACY_TOOLS",f"Agent {safe_label(agent['id'])} uses legacy tools field",f"{safe_label(agent['scope'])} agent metadata contains `tools`.","V2 recommends granular `permission` rules; old booleans can obscure which actions remain available.","Inspect the agent and consider explicit permissions for read/edit/bash; do not change automatically.",base.DOCS["Agents"])
-        edit_state=permission_decision(agent,"edit"); bash_state=permission_decision(agent,"bash")
-        if likely_readonly and (edit_state!="deny" or bash_state!="deny"):
-            add_finding(findings,"High","READONLY_AGENT_UNRESTRICTED",f"Read-only-sounding agent {safe_label(agent['id'])} lacks explicit edit/bash denial",f"Agent appears to be reviewer/auditor/explorer by name/description, but edit={edit_state or 'unspecified'} and bash={bash_state or 'unspecified'}.","The agent could modify files or run shell commands despite its read-only role description.","Add agent-scoped deny rules for edit and bash (using the installed schema's `permission` map or `permissions` rules), then test against a disposable repository.",base.DOCS["Agents"])
-        if not agent.get("description"):
+            add_finding(findings,"Medium","AGENT_LEGACY_TOOLS",f"Agent {safe_label(agent['id'])} uses legacy tools field",f"{safe_label(agent['scope'])} agent metadata contains `tools`.","V2 uses granular `permissions` rules with explicit actions and resources; legacy booleans can obscure which actions remain available.","Inspect the agent and consider explicit v2 rules for `edit` and `shell`; do not change automatically.",base.DOCS["Agents"])
+        edit_state=effective_agent_permission(agent,perms,"edit"); shell_state=effective_agent_permission(agent,perms,"shell")
+        if likely_readonly and (edit_state!="deny" or shell_state!="deny"):
+            proven_allow=edit_state=="allow" or shell_state=="allow"
+            severity="High" if proven_allow else "Medium"
+            code="READONLY_AGENT_CAPABILITY" if proven_allow else "READONLY_AGENT_POLICY_UNRESOLVED"
+            evidence=f"Custom/overridden agent is described as read-only-like; edit={edit_state or 'unspecified'}, shell={shell_state or 'unspecified'}. Only explicit matching rules are summarized; unspecified does not establish runtime permission."
+            impact=("A matching allow rule explicitly grants a capability that can modify files or execute shell commands." if proven_allow else "The visible agent-specific rules do not prove a read-only policy. Global/default policy and tool-level safeguards may affect actual behavior.")
+            action="If strict read-only behavior is required, add agent-scoped deny rules for `edit` and `shell`, then test in a disposable repository. Do not infer shell access from a missing or legacy `bash` field."
+            add_finding(findings,severity,code,f"Read-only-like agent {safe_label(agent['id'])} needs permission review",evidence,impact,action,base.DOCS["Agents"])
+        if not agent.get("description") and classification in ("custom","overridden built-in"):
             add_finding(findings,"Low","AGENT_NO_DESCRIPTION",f"Agent {safe_label(agent['id'])} has no description",f"No description metadata was detected for {safe_label(agent['scope'])} agent.","OpenCode may have less information for deciding when to invoke a specialized agent.","Add a concise, task-specific description.",base.DOCS["Agents"])
     if remote_skill_count:
         add_finding(findings,"Medium","REMOTE_SKILL_CATALOG","Remote skill catalogs are configured",f"Detected {remote_skill_count} HTTP(S) catalog URL(s); URLs and contents were not fetched or printed.","Remote catalogs can change the skills and instructions advertised to the model, expanding trust and network boundaries.","Review catalog ownership, HTTPS/origin controls, index entries, and version changes; enable only trusted sources.",base.DOCS["Skills"])
@@ -607,7 +673,21 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
     roots=source_roots(project_dir,global_only)
     extra_skill_roots,remote_skill_catalogs=configured_skill_roots(merged,project_dir)
     agents,skills,commands,plugins,custom_tools=inventory_files(roots,skill_roots(project_dir,global_only)+extra_skill_roots)
-    agents.extend(configured_agents(merged))
+    explicit_agent_ids=set(agent_map(static_merged))|{str(item["id"]) for item in agents}
+    for item in agents:
+        if item["id"] in BUILTIN_AGENT_IDS:
+            item["classification"]="overridden built-in"
+    resolved_agents=configured_agents(merged,explicit_agent_ids,resolved=debug_result.get("config") is not None)
+    existing_by_id={str(item["id"]):index for index,item in enumerate(agents)}
+    for resolved_agent in resolved_agents:
+        prior_index=existing_by_id.get(str(resolved_agent["id"]))
+        if prior_index is None:
+            agents.append(resolved_agent)
+            existing_by_id[str(resolved_agent["id"])]=len(agents)-1
+        else:
+            # Keep the CLI-resolved definition for analysis, but preserve its local origin classification.
+            resolved_agent["classification"]=agents[prior_index].get("classification","custom")
+            agents[prior_index]=resolved_agent
     languages,file_count,truncated=({},0,False) if global_only else scan_languages(project_dir)
     schema,schema_error=(None,"offline mode") if offline else fetch_schema()
     schema_findings,schema_ok=top_schema_check(parsed,schema) if schema else ([],False)
@@ -697,9 +777,11 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
         names=[k for k in permissions if not is_secret_key(str(k))]
         rule_summary=", ".join(f"`{safe_label(key)}`={permissions[key] if permissions[key] in ('allow','ask','deny') else '[rule map/other]'}" for key in names[:30])
     elif isinstance(permissions,list):
-        rule_summary=", ".join(f"`{safe_label(r.get('action','?'))}`={r.get('effect','?')}" for r in permissions[:30] if isinstance(r,dict))
+        rule_summary=", ".join(f"`{safe_label(r.get('action','?'))}`[{safe_resource_label(r.get('resource','*'))}]={safe_label(r.get('effect','?'))}#{index}" for index,r in enumerate(permissions,1) if isinstance(r,dict))
     else: rule_summary=""
     lines.append("- Global permission rules: "+(rule_summary or "none explicit"))
+    if isinstance(permissions,list) and permissions:
+        lines.append("  - V2 matching uses `action` + `resource`; the last matching rule in this list wins. Resource paths/patterns are withheld or generalized.")
     policies=merged.get("policies",[])
     if isinstance(policies,list) and policies:
         policy_summary=", ".join(f"{safe_label(r.get('action','?'))}={r.get('effect','?')}" for r in policies[:20] if isinstance(r,dict))
@@ -720,16 +802,17 @@ def create_report(project_dir: Path, offline=False, global_only=False, check_mcp
     if package_names:
         lines.append("  - Plugin IDs: "+", ".join(f"`{name[:100]}`" for name in package_names[:25])+(" (additional entries omitted)" if len(package_names)>25 else ""))
     if plugins: lines.append("  - Local plugin filenames: "+", ".join(f"`{name}`" for name in plugins[:25]))
-    lines.append(f"- Custom agents discovered: {len(agents)}; skills: {len(skills)}; custom commands: {len(commands)}; custom tool files: {len(custom_tools)}.")
+    agent_counts={kind:sum(1 for item in agents if item.get("classification")==kind) for kind in ("custom","built-in","overridden built-in")}
+    lines.append(f"- Agents discovered: {len(agents)} ({agent_counts['custom']} custom, {agent_counts['built-in']} built-in, {agent_counts['overridden built-in']} overridden built-in); skills: {len(skills)}; custom commands: {len(commands)}; custom tool files: {len(custom_tools)}.")
     if custom_tools: lines.append("  - Custom tool file IDs: "+", ".join(f"`{safe_label(item['id'])}` ({safe_label(item['scope'])})" for item in custom_tools[:40])+ (" (additional entries omitted)" if len(custom_tools)>40 else ""))
     configured_commands=merged.get("commands",merged.get("command",{}))
     command_names=list(configured_commands) if isinstance(configured_commands,dict) else []
     command_names += commands
     if command_names: lines.append("  - Command IDs: "+", ".join(f"`{safe_label(name)}`" for name in sorted(set(command_names))[:40]))
     for agent in agents:
-        edit_state=permission_decision(agent,"edit"); bash_state=permission_decision(agent,"bash")
+        edit_state=effective_agent_permission(agent,permissions,"edit"); shell_state=effective_agent_permission(agent,permissions,"shell")
         model=f"; model={safe_label(agent['model'])}" if agent.get("model") else ""
-        lines.append(f"  - Agent `{safe_label(agent['id'])}` ({safe_label(agent['scope'])}, mode={safe_label(agent['mode'])}): description={'yes' if agent['description'] else 'no'}; edit={edit_state or 'unspecified'}, bash={bash_state or 'unspecified'}{model}.")
+        lines.append(f"  - Agent `{safe_label(agent['id'])}` ({safe_label(agent.get('classification','custom'))}, {safe_label(agent['scope'])}, mode={safe_label(agent['mode'])}): description={'yes' if agent['description'] else 'no'}; edit={edit_state or 'unspecified'}, shell={shell_state or 'unspecified'} (combined visible rules; wildcard resource only){model}.")
     for skill in skills: lines.append(f"  - Skill `{safe_label(skill['id'])}` ({safe_label(skill['scope'])}): description={'yes' if skill['description'] else 'no'}.")
     lines.append("- Formatter: "+("present" if merged.get("formatter") else "not explicitly configured/false")+"; LSP: "+("present" if merged.get("lsp") else "not explicitly configured/false")+".")
     lines.append("- Project languages inferred from file extensions: "+(", ".join(f"{lang} ({n} files)" for lang,n in sorted(languages.items(),key=lambda x:-x[1])[:12]) if languages else "none detected in this folder")+". No source file contents were read.")

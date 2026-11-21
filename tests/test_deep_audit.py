@@ -41,14 +41,51 @@ class DeepAuditTests(unittest.TestCase):
         self.assertEqual(normalized[0]["model"],"provider/model-x")
         self.assertEqual(audit.permission_decision(normalized[0],"edit"),"deny")
 
+    def test_builtin_custom_and_overridden_agents_are_distinguished(self):
+        agents=audit.configured_agents(
+            {"agents":{"explore":{"mode":"subagent"},"review":{"mode":"subagent"},"build":{"description":"My build override"}}},
+            explicit_agent_ids={"build"},resolved=True,
+        )
+        kinds={item["id"]:item["classification"] for item in agents}
+        self.assertEqual(kinds,{"explore":"built-in","review":"custom","build":"overridden built-in"})
+
+    def test_v2_permission_resources_and_last_matching_rule_win(self):
+        entry={"permissions":[
+            {"action":"shell","resource":"*","effect":"ask"},
+            {"action":"shell","resource":"git *","effect":"allow"},
+            {"action":"shell","resource":"git push*","effect":"deny"},
+        ]}
+        self.assertEqual(audit.permission_decision(entry,"shell","git status"),"allow")
+        self.assertEqual(audit.permission_decision(entry,"shell","git push origin"),"deny")
+        self.assertEqual(audit.permission_decision(entry,"shell","python app.py"),"ask")
+        self.assertIsNone(audit.permission_decision(entry,"bash","git status"))
+
+    def test_agent_permissions_are_evaluated_after_global_rules(self):
+        global_rules=[{"action":"shell","resource":"*","effect":"allow"}]
+        agent={"permissions":[{"action":"shell","resource":"git push*","effect":"deny"}]}
+        self.assertEqual(audit.effective_agent_permission(agent,global_rules,"shell","git push origin"),"deny")
+        self.assertEqual(audit.effective_agent_permission(agent,global_rules,"shell","git status"),"allow")
+
+    def test_builtin_agents_do_not_receive_custom_quality_findings(self):
+        builtin={"id":"explore","scope":"resolved CLI config","mode":"subagent","description":False,"role_text":"","permissions":[],"classification":"built-in"}
+        findings=audit.analyze([],{},[builtin],[],[],[],Path("."),True)
+        self.assertFalse(any(item["code"].startswith("AGENT_") or item["code"].startswith("READONLY_AGENT_") for item in findings))
+
+    def test_readonly_like_custom_agent_is_not_claimed_unsafe_without_allow_evidence(self):
+        custom={"id":"reviewer","scope":"project","mode":"subagent","description":True,"role_text":"read-only code review","permissions":[],"classification":"custom"}
+        findings=audit.analyze([],{},[custom],[],[],[],Path("."),True)
+        finding=next(item for item in findings if item["code"]=="READONLY_AGENT_POLICY_UNRESOLVED")
+        self.assertEqual(finding["severity"],"Medium")
+        self.assertIn("do not prove",finding["impact"])
+
     def test_permissions_rules_and_legacy_map(self):
         self.assertEqual(audit.permission_decision({"permission":{"edit":"deny"}},"edit"),"deny")
         entry={"permissions":[
             {"action":"edit","resource":"*","effect":"deny"},
-            {"action":"bash","resource":"*","effect":"ask"},
+            {"action":"shell","resource":"*","effect":"ask"},
         ]}
         self.assertEqual(audit.permission_decision(entry,"edit"),"deny")
-        self.assertEqual(audit.permission_decision(entry,"bash"),"ask")
+        self.assertEqual(audit.permission_decision(entry,"shell"),"ask")
         self.assertIsNone(audit.permission_decision(entry,"webfetch"))
         self.assertEqual(audit.permission_decision({"permission":{"*":"deny"}},"edit"),"deny")
         self.assertEqual(audit.permission_decision({"tools":{"edit":False,"bash":False}},"edit"),"deny")
