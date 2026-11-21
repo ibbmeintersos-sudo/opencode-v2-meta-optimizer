@@ -60,6 +60,35 @@ class DeepAuditTests(unittest.TestCase):
         self.assertEqual(audit.permission_decision(entry,"shell","python app.py"),"ask")
         self.assertIsNone(audit.permission_decision(entry,"bash","git status"))
 
+    def test_v2_nested_custom_file_resources_apply_ordered_exceptions(self):
+        entry={"permissions":[
+            {"action":"edit","resource":"*","effect":"allow"},
+            {"action":"edit","resource":"src/**","effect":"deny"},
+            {"action":"edit","resource":"src/generated/**","effect":"allow"},
+            {"action":"edit","resource":"src/generated/secrets.*","effect":"deny"},
+        ]}
+        self.assertEqual(audit.permission_decision(entry,"edit","README.md"),"allow")
+        self.assertEqual(audit.permission_decision(entry,"edit","src/app.py"),"deny")
+        self.assertEqual(audit.permission_decision(entry,"edit","src/generated/client.py"),"allow")
+        self.assertEqual(audit.permission_decision(entry,"edit","src/generated/secrets.toml"),"deny")
+
+    def test_v2_custom_action_and_resource_names_are_not_discarded(self):
+        entry={"permissions":[
+            {"action":"*","resource":"pipeline:*","effect":"ask"},
+            {"action":"deployment.run","resource":"pipeline:production","effect":"deny"},
+        ]}
+        self.assertEqual(audit.permission_decision(entry,"deployment.run","pipeline:staging"),"ask")
+        self.assertEqual(audit.permission_decision(entry,"deployment.run","pipeline:production"),"deny")
+        self.assertIsNone(audit.permission_decision(entry,"deployment.delete","database:production"))
+
+    def test_v2_permission_detail_reports_matching_resource_and_order(self):
+        entry={"permissions":[
+            {"action":"edit","resource":"src/**","effect":"deny"},
+            {"action":"edit","resource":"src/public/**","effect":"allow"},
+        ]}
+        detail=audit.permission_decision_detail(entry,"edit","src/public/readme.md")
+        self.assertEqual(detail,{"effect":"allow","action":"edit","resource":"src/public/**","order":2,"source":"v2 permissions"})
+
     def test_agent_permissions_are_evaluated_after_global_rules(self):
         global_rules=[{"action":"shell","resource":"*","effect":"allow"}]
         agent={"permissions":[{"action":"shell","resource":"git push*","effect":"deny"}]}
