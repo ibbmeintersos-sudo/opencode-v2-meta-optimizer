@@ -89,6 +89,29 @@ class DeepAuditTests(unittest.TestCase):
         detail=audit.permission_decision_detail(entry,"edit","src/public/readme.md")
         self.assertEqual(detail,{"effect":"allow","action":"edit","resource":"src/public/**","order":2,"source":"v2 permissions"})
 
+    def test_v2_resource_matcher_treats_regex_metacharacters_as_literals(self):
+        entry={"permissions":[
+            {"action":"edit","resource":r"^src/[a-z]+\.py$","effect":"deny"},
+        ]}
+        self.assertIsNone(audit.permission_decision(entry,"edit","src/app.py"))
+        self.assertEqual(audit.permission_decision(entry,"edit",r"^src/[a-z]+\.py$"),"deny")
+
+    def test_v2_resource_matcher_supports_only_documented_star_and_question_wildcards(self):
+        entry={"permissions":[
+            {"action":"edit","resource":r"src\**\main?.py","effect":"allow"},
+        ]}
+        self.assertEqual(audit.permission_decision(entry,"edit","src/lib/nested/main1.py"),"allow")
+        self.assertIsNone(audit.permission_decision(entry,"edit","src/lib/main12.py"))
+        bracket_pattern={"permissions":[{"action":"edit","resource":"src/[ab].py","effect":"deny"}]}
+        self.assertIsNone(audit.permission_decision(bracket_pattern,"edit","src/a.py"))
+
+    def test_grep_regex_is_a_resource_value_but_is_not_executed_by_permission_matching(self):
+        entry={"permissions":[
+            {"action":"grep","resource":"*TODO\\s+FIXME*","effect":"deny"},
+        ]}
+        self.assertEqual(audit.permission_decision(entry,"grep",r"TODO\s+FIXME"),"deny")
+        self.assertIsNone(audit.permission_decision(entry,"grep",r"BUG\s+FIXME"))
+
     def test_agent_permissions_are_evaluated_after_global_rules(self):
         global_rules=[{"action":"shell","resource":"*","effect":"allow"}]
         agent={"permissions":[{"action":"shell","resource":"git push*","effect":"deny"}]}

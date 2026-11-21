@@ -3,7 +3,6 @@
 from __future__ import annotations
 import argparse
 import datetime as dt
-import fnmatch
 import json
 import os
 from pathlib import Path
@@ -377,14 +376,23 @@ def configured_agents(merged, explicit_agent_ids=None, resolved=False):
     return result
 
 
-def _resource_matches(pattern, resource):
-    """Match OpenCode permission resource globs without treating unrelated scopes as global."""
+def _resource_matches(pattern, resource, action=None):
+    """Match OpenCode's whole-resource wildcards: only `*` and `?` are special."""
     pattern=str(pattern or "*")
     resource=str(resource or "*")
     if pattern in ("*", "**"): return True
     if resource in ("*", "**"):
         return pattern in ("*", "**")
-    return fnmatch.fnmatchcase(resource,pattern)
+    if action in ("read","edit","external_directory"):
+        pattern=pattern.replace("\\","/")
+        resource=resource.replace("\\","/")
+    regex=[]
+    for char in pattern:
+        if char=="*": regex.append("[\\s\\S]*")
+        elif char=="?": regex.append("[\\s\\S]")
+        else: regex.append(re.escape(char))
+    flags=re.IGNORECASE if os.name=="nt" and action in ("read","edit","external_directory") else 0
+    return re.fullmatch("".join(regex),resource,flags=flags) is not None
 
 
 def permission_decision_detail(entry, action, resource="*"):
@@ -393,7 +401,7 @@ def permission_decision_detail(entry, action, resource="*"):
     if isinstance(legacy,dict) and (action in legacy or "*" in legacy):
         value=legacy.get(action,legacy.get("*"))
         if isinstance(value,dict):
-            matches=[(str(k),v) for k,v in value.items() if _resource_matches(k,resource)]
+            matches=[(str(k),v) for k,v in value.items() if _resource_matches(k,resource,action)]
             if matches: return {"effect":matches[-1][1],"action":action,"resource":matches[-1][0],"order":None,"source":"legacy permission map"}
             return None
         return {"effect":value,"action":action,"resource":"*","order":None,"source":"legacy permission map"}
@@ -408,7 +416,7 @@ def permission_decision_detail(entry, action, resource="*"):
         for index,rule in enumerate(rules,1):
             if not isinstance(rule,dict): continue
             rule_action=str(rule.get("action","")); rule_resource=str(rule.get("resource","*"))
-            if rule_action not in (action,"*") or not _resource_matches(rule_resource,resource): continue
+            if rule_action not in (action,"*") or not _resource_matches(rule_resource,resource,action): continue
             matched.append({"effect":rule.get("effect"),"action":rule_action,"resource":rule_resource,"order":index,"source":"v2 permissions"})
     return matched[-1] if matched else None
 
